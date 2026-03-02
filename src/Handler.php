@@ -425,7 +425,7 @@ public function run(): Task
             // STEP 5 - EXECUTE JOIN TABLE QUERY
             // ==================================================================
     
-            $joinSelectStr = implode(', ', $joinFetchCols);
+            $joinSelectStr = $selectStar ? '*' : implode(', ', $joinFetchCols);
             $joinWhereStr = !empty($joinTableConditions)
                 ? 'WHERE ' . implode(' AND ', $joinTableConditions)
                 : '';
