@@ -479,6 +479,11 @@ final class Handler extends BaseHandlerWithClient
 					$catRow = $catRows[$idx];
 					$count  = (int)($aggRow["_c{$idx}"] ?? 0);
 
+					// INNER JOIN semantics: skip categories with no matching articles
+					if ($count === 0) {
+						continue;
+					}
+
 					$row = [];
 					if ($hasCountStar) {
 						$row[$countStarAlias] = $count;
