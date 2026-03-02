@@ -206,31 +206,48 @@ function run(): Task
         $mainTable = $m[1];
         $joinTable = $m[2];
 
-        // ON condition - identify which side is the MVA field and which is the join key
-        if (!preg_match('/\bON\s+([\w.]+)\s*=\s*([\w.]+)/i', $query, $m)) {
+        // ON clause — extract all AND-separated conditions.
+        // Stops at WHERE, GROUP BY, ORDER BY, LIMIT, or a second MVA JOIN keyword.
+        if (!preg_match(
+            '/\bFROM\s+\w+\s+MVA\s+JOIN\s+\w+\s+ON\s+(.*?)(?=\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|MVA\s+JOIN)\b|$)/is',
+            $query, $m
+        )) {
             throw new RuntimeException('MVA JOIN plugin: failed to parse ON condition');
         }
-        [$onLeft, $onRight] = [$m[1], $m[2]];
+        $onClause = preg_replace('/\s+/', ' ', trim($m[1]));
+        $onParts  = preg_split('/\s+AND\s+/i', $onClause);
 
-        $leftTable = '';
-        $leftField = $onLeft;
-        if (str_contains($onLeft, '.')) {
-            [$leftTable, $leftField] = explode('.', $onLeft, 2);
+        $mvaJoinConds = [];  // [['mvaField' => ..., 'joinField' => ...], ...]
+        foreach ($onParts as $onPart) {
+            $onPart = trim($onPart);
+            if (!preg_match('/([\w.]+)\s*=\s*([\w.]+)/', $onPart, $cm)) {
+                continue;
+            }
+            $onLeft  = $cm[1];
+            $onRight = $cm[2];
+            $leftTable = '';
+            $leftField = $onLeft;
+            if (str_contains($onLeft, '.')) {
+                [$leftTable, $leftField] = explode('.', $onLeft, 2);
+            }
+            $rightTable = '';
+            $rightField = $onRight;
+            if (str_contains($onRight, '.')) {
+                [$rightTable, $rightField] = explode('.', $onRight, 2);
+            }
+            // The MVA field lives on the main table; the join field on the join table
+            if (strcasecmp($leftTable, $mainTable) === 0 || strcasecmp($rightTable, $joinTable) === 0) {
+                $mvaJoinConds[] = ['mvaField' => $leftField, 'joinField' => $rightField];
+            } else {
+                $mvaJoinConds[] = ['mvaField' => $rightField, 'joinField' => $leftField];
+            }
         }
-        $rightTable = '';
-        $rightField = $onRight;
-        if (str_contains($onRight, '.')) {
-            [$rightTable, $rightField] = explode('.', $onRight, 2);
+        if (empty($mvaJoinConds)) {
+            throw new RuntimeException('MVA JOIN plugin: failed to parse ON condition');
         }
-
-        // The MVA field lives on the main table; the join field lives on the join table
-        if (strcasecmp($leftTable, $mainTable) === 0 || strcasecmp($rightTable, $joinTable) === 0) {
-            $mvaField = $leftField;
-            $joinField = $rightField;
-        } else {
-            $mvaField = $rightField;
-            $joinField = $leftField;
-        }
+        // Primary condition (first in ON clause) — used for keyword lookup map
+        $mvaField  = $mvaJoinConds[0]['mvaField'];
+        $joinField = $mvaJoinConds[0]['joinField'];
 
         // WHERE clause (stop before GROUP BY / ORDER BY / LIMIT / HAVING)
         $whereClause = '';
@@ -557,11 +574,18 @@ function run(): Task
         // Prevents SQL errors when the join field holds non-integer values.
         $quoteKw = static fn($k) => is_numeric($k) ? $k : "'" . addslashes((string)$k) . "'";
 
+        // Build a combined MVA IN condition from all ON clause conditions.
+        // With multiple ON conditions they are ANDed: (f1 IN (...) AND f2 IN (...))
+        $buildMvaInCond = static function (string $kwList) use ($mvaJoinConds): string {
+            $parts = array_map(static fn($c) => "{$c['mvaField']} IN ({$kwList})", $mvaJoinConds);
+            return count($parts) === 1 ? $parts[0] : '(' . implode(' AND ', $parts) . ')';
+        };
+
             $allKwList = implode(',', array_map($quoteKw, $allKeywords));
-    
+
             // Build the main-table WHERE string
             $mainWhereParts = $mainTableConditions;
-            $mainWhereParts[] = "{$mvaField} IN ({$allKwList})";
+            $mainWhereParts[] = $buildMvaInCond($allKwList);
             $mainWhereStr = 'WHERE ' . implode(' AND ', $mainWhereParts);
     
             // SELECT * - join-table columns read from $catRows at result time;
@@ -629,7 +653,7 @@ function run(): Task
                         continue;
                     }
                     // Alias: _c0, _c1, _c2, ... (safe SQL identifiers)
-                    $sumExprs[] = "SUM({$mvaField} IN ({$kwList})) AS `_c{$idx}`";
+                    $sumExprs[] = "SUM(" . $buildMvaInCond($kwList) . ") AS `_c{$idx}`";
                     $validIdxs[] = $idx;
                 }
 
@@ -671,7 +695,7 @@ function run(): Task
                             continue;
                         }
                         $catWhereParts = $mainTableConditions;
-                        $catWhereParts[] = "{$mvaField} IN ({$kwList})";
+                        $catWhereParts[] = $buildMvaInCond($kwList);
                         $catWhereStr = 'WHERE ' . implode(' AND ', $catWhereParts);
                         $catRow = [];
 
@@ -740,10 +764,11 @@ function run(): Task
                     $catRow = $catRows[$idx];
                     $mainRow = $needPerCategoryQuery ? ($catMainData[$idx] ?? []) : [];
                     $row = [];
+                    $mvaFieldNames = array_column($mvaJoinConds, 'mvaField');
                     if ($selectStar) {
                         // Main-table columns first (they keep the bare name on conflict)
                         foreach ($mainRow as $col => $val) {
-                            if ($col !== $mvaField) {
+                            if (!in_array($col, $mvaFieldNames, true)) {
                                 $row[$col] = $val;
                             }
                         }
@@ -814,7 +839,13 @@ function run(): Task
             // per (article, matching-category) pair.
             // ==================================================================
     
-            $mainFetchCols = [$mvaField];  // always need the MVA field for matching
+            // Always fetch all MVA fields referenced in ON conditions (needed for AND-matching)
+            $mainFetchCols = [];
+            foreach ($mvaJoinConds as $cond) {
+                if (!in_array($cond['mvaField'], $mainFetchCols, true)) {
+                    $mainFetchCols[] = $cond['mvaField'];
+                }
+            }
             foreach ($mainTableSelectFields as $f) {
                 if (!in_array($f['column'], $mainFetchCols, true)) {
                     $mainFetchCols[] = $f['column'];
@@ -844,26 +875,38 @@ function run(): Task
             // Expand: one output row per (article, matching join-table row)
             $resultRows = [];
             foreach ($articleRows as $artRow) {
-                $artKeywords = $extractMva($artRow[$mvaField] ?? '');
-
-                // Collect all matching join-table indices, deduplicated per join row
+                // Collect matching join-table indices for the primary ON condition
                 $matchedIdxs = [];
-                foreach ($artKeywords as $kw) {
+                foreach ($extractMva($artRow[$mvaJoinConds[0]['mvaField']] ?? '') as $kw) {
                     if (isset($kwToCatIdxs[$kw])) {
                         foreach ($kwToCatIdxs[$kw] as $idx) {
                             $matchedIdxs[$idx] = true;
                         }
                     }
                 }
+                // AND-intersect with each additional ON condition
+                foreach (array_slice($mvaJoinConds, 1) as $extraCond) {
+                    $extraSet = [];
+                    foreach ($extractMva($artRow[$extraCond['mvaField']] ?? '') as $kw) {
+                        if (isset($kwToCatIdxs[$kw])) {
+                            foreach ($kwToCatIdxs[$kw] as $idx) {
+                                $extraSet[$idx] = true;
+                            }
+                        }
+                    }
+                    $matchedIdxs = array_intersect_key($matchedIdxs, $extraSet);
+                }
 
                 foreach (array_keys($matchedIdxs) as $idx) {
                     $catRow = $catRows[$idx];
                     $row = [];
 
+                    // Build set of MVA field names from all ON conditions (excluded from SELECT *)
+                    $mvaFieldNames = array_column($mvaJoinConds, 'mvaField');
                     if ($selectStar) {
-                        // All main-table columns except the raw MVA field
+                        // All main-table columns except raw MVA join fields
                         foreach ($artRow as $col => $val) {
-                            if ($col !== $mvaField) {
+                            if (!in_array($col, $mvaFieldNames, true)) {
                                 $row[$col] = $val;
                             }
                         }
