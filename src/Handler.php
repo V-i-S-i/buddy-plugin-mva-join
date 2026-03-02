@@ -330,6 +330,32 @@ function run(): Task
                 continue;
             }
 
+            // SUM(mainTable.mvaField2 IN (joinTable.joinField)) [AS alias]
+            // Counts per-category matches on a second MVA field of the main table.
+            if (preg_match(
+                '/^SUM\s*\(\s*(?:(\w+)\.)(\w+)\s+IN\s*\(\s*(?:(\w+)\.)(\w+)\s*\)\s*\)(?:\s+AS\s+(\w+))?$/i',
+                $part, $mm
+            )) {
+                $mvaTableRef = $mm[1] ?? '';
+                $mvaField2   = $mm[2];
+                $kwTableRef  = $mm[3] ?? '';
+                $kwFieldRef  = $mm[4];
+                $alias       = isset($mm[5]) && $mm[5] !== '' ? $mm[5] : null;
+                if (strcasecmp($mvaTableRef, $mainTable) === 0
+                    && strcasecmp($kwTableRef, $joinTable) === 0) {
+                    $mainTableAggExprs[] = [
+                        'func'         => 'SUM_MVA_IN',
+                        'column'       => $mvaField2,
+                        'joinKeyField' => $kwFieldRef,
+                        'outputName'   => $alias ?? $part,
+                        'sqlExpr'      => '',  // built dynamically per-category
+                        'sqlAlias'     => '_mva_' . count($mainTableAggExprs),
+                    ];
+                    $selectOrder[] = ['type' => 'agg', 'idx' => count($mainTableAggExprs) - 1];
+                }
+                continue;
+            }
+
             // Aggregate functions on main-table fields: SUM(t.col), AVG(t.col), GROUP_CONCAT(t.col)
             if (preg_match('/^(SUM|AVG|MIN|MAX|GROUP_CONCAT)\s*\(/i', $part)) {
                 if (preg_match(
@@ -631,7 +657,13 @@ function run(): Task
                         if (!empty($mainTableAggExprs)) {
                             $aggParts = [];
                             foreach ($mainTableAggExprs as $agg) {
-                                $aggParts[] = $agg['sqlExpr'] . ' AS ' . $agg['sqlAlias'];
+                                if ($agg['func'] === 'SUM_MVA_IN') {
+                                    // Dynamic: SUM(mvaField2 IN (cat_keywords)) per category
+                                    $catKwList = implode(',', array_map($quoteKw, $catKeywords[$idx]));
+                                    $aggParts[] = "SUM({$agg['column']} IN ({$catKwList})) AS {$agg['sqlAlias']}";
+                                } else {
+                                    $aggParts[] = $agg['sqlExpr'] . ' AS ' . $agg['sqlAlias'];
+                                }
                             }
                             $aggQuery = 'SELECT ' . implode(', ', $aggParts) . " FROM {$mainTable} {$catWhereStr}";
                             file_put_contents($logFile, "  [Per-cat agg idx={$idx}]: " . substr($aggQuery, 0, 500) . "\n", FILE_APPEND);
