@@ -28,12 +28,24 @@ The `ON` clause must link the MVA field on the main table to the corresponding f
 
 | Expression | Example | Notes |
 |---|---|---|
+| `*` | `SELECT *` | All columns from both tables |
 | Join-table column | `categories.name` | Must be prefixed with the join table name |
 | Main-table column | `articles.feed_id` | Must be prefixed with the main table name |
 | `COUNT(*)` | `COUNT(*) AS cnt` | Counts matching main-table rows per join-table row |
 | Aggregate functions | `SUM(articles.auditorium)` | `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT` supported |
 
 Column order in the result set matches the order in the SELECT list.
+
+### Column name conflicts
+
+When both tables have a column with the same bare name (e.g. both have `id`), the main-table column keeps the bare name and the join-table column is qualified as `{join_table}.{column}`:
+
+```
+articles_today_lt.id  →  id
+categories.id         →  categories.id
+```
+
+Explicit `AS` aliases always take precedence and are never renamed.
 
 ## WHERE conditions
 
@@ -67,12 +79,19 @@ Internally:
 2. Runs one aggregation query with `SUM(mva_field IN (kw1, kw2, ...))` per join-table row to count matches.
 3. For each matched join-table row, runs a targeted per-category query for any `SUM`/`GROUP_CONCAT`/etc. expressions and raw main-table columns.
 
-### Mode B — Row expansion (no GROUP BY, main-table columns in SELECT)
+### Mode B — Row expansion (no GROUP BY)
 
-One result row per `(main-table row, join-table row)` pair.
+One result row per `(main-table row, join-table row)` pair. Supports explicit column lists or `SELECT *`.
 
 ```sql
+-- Explicit columns
 SELECT articles.id, articles.title, categories.name
+FROM articles
+MVA JOIN categories ON articles.keyword_id = categories.keyword_id
+WHERE categories.customer_id = 7037;
+
+-- All columns from both tables
+SELECT *
 FROM articles
 MVA JOIN categories ON articles.keyword_id = categories.keyword_id
 WHERE categories.customer_id = 7037;
