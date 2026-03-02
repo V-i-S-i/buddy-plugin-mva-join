@@ -306,6 +306,8 @@ final class Handler extends BaseHandlerWithClient
 			$countStarAlias        = 'COUNT(*)';
 			$joinTableSelectFields = [];  // [{column, alias}]
 			$mainTableSelectFields = [];  // [{column, alias}]
+			$mainTableAggExprs    = [];  // [{func, column, outputName, sqlExpr, sqlAlias}]
+			$selectOrder          = [];  // preserves original SELECT column order
 
 			foreach ($splitByComma($selectList) as $part) {
 				$part = trim($part);
@@ -314,11 +316,30 @@ final class Handler extends BaseHandlerWithClient
 				if (preg_match('/^COUNT\s*\(\s*\*\s*\)(?:\s+AS\s+(\S+))?$/i', $part, $mm)) {
 					$hasCountStar   = true;
 					$countStarAlias = $mm[1] ?? 'COUNT(*)';
+					$selectOrder[]  = ['type' => 'count'];
 					continue;
 				}
 
-				// Other aggregate functions (SUM, AVG, MIN, MAX) – skip in MVP
-				if (preg_match('/^(?:SUM|AVG|MIN|MAX)\s*\(/i', $part)) {
+				// Aggregate functions on main-table fields: SUM(t.col), AVG(t.col), GROUP_CONCAT(t.col)
+				if (preg_match('/^(SUM|AVG|MIN|MAX|GROUP_CONCAT)\s*\(/i', $part)) {
+					if (preg_match(
+						'/^(SUM|AVG|MIN|MAX|GROUP_CONCAT)\s*\(\s*(?:(\w+)\.)?\s*(\w+)\s*\)(?:\s+AS\s+(\w+))?$/i',
+						$part, $mm
+					)) {
+						$tblPrefix = $mm[2] ?? '';
+						$col       = $mm[3];
+						$alias     = isset($mm[4]) && $mm[4] !== '' ? $mm[4] : null;
+						if ($tblPrefix === '' || strcasecmp($tblPrefix, $mainTable) === 0) {
+							$mainTableAggExprs[] = [
+								'func'       => strtoupper($mm[1]),
+								'column'     => $col,
+								'outputName' => $alias ?? $part,
+								'sqlExpr'    => strtoupper($mm[1]) . "({$col})",
+								'sqlAlias'   => '_agg_' . count($mainTableAggExprs),
+							];
+							$selectOrder[] = ['type' => 'agg', 'idx' => count($mainTableAggExprs) - 1];
+						}
+					}
 					continue;
 				}
 
@@ -329,8 +350,10 @@ final class Handler extends BaseHandlerWithClient
 					$alias = $mm[3] ?? null;
 					if (strcasecmp($tbl, $joinTable) === 0) {
 						$joinTableSelectFields[] = ['column' => $col, 'alias' => $alias];
+						$selectOrder[]           = ['type' => 'join', 'idx' => count($joinTableSelectFields) - 1];
 					} elseif (strcasecmp($tbl, $mainTable) === 0) {
 						$mainTableSelectFields[] = ['column' => $col, 'alias' => $alias];
+						$selectOrder[]           = ['type' => 'raw', 'idx' => count($mainTableSelectFields) - 1];
 					}
 					continue;
 				}
@@ -340,6 +363,9 @@ final class Handler extends BaseHandlerWithClient
 
 			// Mode: aggregation when COUNT(*) or GROUP BY is present
 			$isAggregation = $hasCountStar || $groupBy !== '';
+
+			// Per-category queries needed when SELECT references main-table fields/aggregates
+			$needPerCategoryQuery = !empty($mainTableAggExprs) || !empty($mainTableSelectFields);
 
 			file_put_contents(
 				$logFile,
@@ -474,24 +500,97 @@ final class Handler extends BaseHandlerWithClient
 
 				file_put_contents($logFile, '  Aggregation row: ' . json_encode($aggRow) . "\n", FILE_APPEND);
 
-				// Map aggregation columns back into result rows
-				$resultRows = [];
+				// Identify matched categories (INNER JOIN semantics: count > 0)
+				$matchedIdxMap = [];
 				foreach ($validIdxs as $idx) {
-					$catRow = $catRows[$idx];
-					$count  = (int)($aggRow["_c{$idx}"] ?? 0);
-
-					// INNER JOIN semantics: skip categories with no matching articles
-					if ($count === 0) {
-						continue;
+					$count = (int)($aggRow["_c{$idx}"] ?? 0);
+					if ($count > 0) {
+						$matchedIdxMap[$idx] = $count;
 					}
+				}
 
-					$row = [];
-					if ($hasCountStar) {
-						$row[$countStarAlias] = $count;
+				// Per-category queries: aggregates and raw fields run in separate queries
+				// because Manticore rejects mixing aggregate and non-aggregate columns
+				// in one query without GROUP BY.
+				$catMainData = [];
+				if ($needPerCategoryQuery && !empty($matchedIdxMap)) {
+					foreach (array_keys($matchedIdxMap) as $idx) {
+						$kwList = implode(',', $catKeywords[$idx]);
+						if ($kwList === '') {
+							continue;
+						}
+						$catWhereParts   = $mainTableConditions;
+						$catWhereParts[] = "{$mvaField} IN ({$kwList})";
+						$catWhereStr     = 'WHERE ' . implode(' AND ', $catWhereParts);
+						$catRow          = [];
+
+						// Aggregate functions (SUM, GROUP_CONCAT, AVG, etc.)
+						if (!empty($mainTableAggExprs)) {
+							$aggParts = [];
+							foreach ($mainTableAggExprs as $agg) {
+								$aggParts[] = $agg['sqlExpr'] . ' AS ' . $agg['sqlAlias'];
+							}
+							$aggQuery = 'SELECT ' . implode(', ', $aggParts) . " FROM {$mainTable} {$catWhereStr}";
+							file_put_contents($logFile, "  [Per-cat agg idx={$idx}]: " . substr($aggQuery, 0, 500) . "\n", FILE_APPEND);
+							$aggResp = $manticoreClient->sendRequest($aggQuery);
+							if ($aggResp->hasError()) {
+								file_put_contents($logFile, "  [Per-cat agg ERR idx={$idx}]: " . $aggResp->getError() . "\n", FILE_APPEND);
+								throw new RuntimeException('MVA JOIN per-category query failed: ' . $aggResp->getError());
+							} else {
+								$aggRespData = $aggResp->getData();
+								$catRow      = array_merge($catRow, $aggRespData[0] ?? []);
+							}
+						}
+
+						// Raw (non-aggregate) main-table fields - pick any matching row
+						if (!empty($mainTableSelectFields)) {
+							$rawParts = [];
+							foreach ($mainTableSelectFields as $f) {
+								$rawParts[] = $f['column'] . ' AS _raw_' . $f['column'];
+							}
+							$rawQuery = 'SELECT ' . implode(', ', $rawParts) . " FROM {$mainTable} {$catWhereStr} LIMIT 1";
+							file_put_contents($logFile, "  [Per-cat raw idx={$idx}]: " . substr($rawQuery, 0, 500) . "\n", FILE_APPEND);
+							$rawResp = $manticoreClient->sendRequest($rawQuery);
+							if ($rawResp->hasError()) {
+								file_put_contents($logFile, "  [Per-cat raw ERR idx={$idx}]: " . $rawResp->getError() . "\n", FILE_APPEND);
+								throw new RuntimeException('MVA JOIN per-category query failed: ' . $rawResp->getError());
+							} else {
+								$rawRespData = $rawResp->getData();
+								$catRow      = array_merge($catRow, $rawRespData[0] ?? []);
+							}
+						}
+
+						$catMainData[$idx] = $catRow;
+						file_put_contents($logFile, "  [Per-cat result idx={$idx}]: " . json_encode($catRow) . "\n", FILE_APPEND);
 					}
-					foreach ($joinTableSelectFields as $f) {
-						$colName      = $f['alias'] ?? $f['column'];
-						$row[$colName] = $catRow[$f['column']] ?? null;
+				}
+
+				// Build result rows
+				$resultRows = [];
+				foreach ($matchedIdxMap as $idx => $count) {
+					$catRow  = $catRows[$idx];
+					$mainRow = $needPerCategoryQuery ? ($catMainData[$idx] ?? []) : [];
+					$row     = [];
+					foreach ($selectOrder as $spec) {
+						switch ($spec['type']) {
+							case 'count':
+								$row[$countStarAlias] = $count;
+								break;
+							case 'join':
+								$f       = $joinTableSelectFields[$spec['idx']];
+								$colName = $f['alias'] ?? $f['column'];
+								$row[$colName] = $catRow[$f['column']] ?? null;
+								break;
+							case 'agg':
+								$agg = $mainTableAggExprs[$spec['idx']];
+								$row[$agg['outputName']] = $mainRow[$agg['sqlAlias']] ?? null;
+								break;
+							case 'raw':
+								$f       = $mainTableSelectFields[$spec['idx']];
+								$colName = $f['alias'] ?? $f['column'];
+								$row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
+								break;
+						}
 					}
 					$resultRows[] = $row;
 				}
