@@ -18,13 +18,13 @@ use RuntimeException;
 /**
  * Resolves MVA JOIN queries in two passes:
  *
- * MODE A – Aggregation (COUNT(*) / GROUP BY present):
+ * MODE A - Aggregation (COUNT(*) / GROUP BY present):
  *   1. Fetch join table rows matching WHERE conditions.
  *   2. Build one SUM(mvaField IN (kw1,kw2,...)) expression per join-table row.
  *   3. Execute a single aggregation query against the main table.
  *   4. Map the per-category counts back into a result set.
  *
- * MODE B – Row query (main table fields in SELECT, no GROUP BY):
+ * MODE B - Row query (main table fields in SELECT, no GROUP BY):
  *   1. Fetch join table rows matching WHERE conditions.
  *   2. Collect all unique keyword values.
  *   3. Fetch matching main table rows (with pagination guard).
@@ -160,7 +160,7 @@ final class Handler extends BaseHandlerWithClient
 						$dir  = strtoupper($dm[1]);
 						$part = trim(substr($part, 0, -strlen($dm[0])));
 					}
-					// Strip optional table prefix (e.g. categories.name → name)
+					// Strip optional table prefix (e.g. categories.name -> name)
 					if (str_contains($part, '.')) {
 						[, $part] = explode('.', $part, 2);
 					}
@@ -184,10 +184,10 @@ final class Handler extends BaseHandlerWithClient
 			};
 
 			// ==================================================================
-			// STEP 1 – PARSE THE MVA JOIN QUERY
+			// STEP 1 - PARSE THE MVA JOIN QUERY
 			// ==================================================================
 
-			// SELECT list (between SELECT and the first FROM … MVA JOIN)
+			// SELECT list (between SELECT and the first FROM ... MVA JOIN)
 			if (!preg_match('/^\s*SELECT\s+(.*?)\s+FROM\s+\w+\s+MVA\s+JOIN\b/is', $query, $m)) {
 				throw new RuntimeException('MVA JOIN plugin: failed to parse SELECT list');
 			}
@@ -200,7 +200,7 @@ final class Handler extends BaseHandlerWithClient
 			$mainTable = $m[1];
 			$joinTable = $m[2];
 
-			// ON condition – identify which side is the MVA field and which is the join key
+			// ON condition - identify which side is the MVA field and which is the join key
 			if (!preg_match('/\bON\s+([\w.]+)\s*=\s*([\w.]+)/i', $query, $m)) {
 				throw new RuntimeException('MVA JOIN plugin: failed to parse ON condition');
 			}
@@ -266,7 +266,7 @@ final class Handler extends BaseHandlerWithClient
 			);
 
 			// ==================================================================
-			// STEP 2 – CLASSIFY WHERE CONDITIONS
+			// STEP 2 - CLASSIFY WHERE CONDITIONS
 			// Conditions prefixed with joinTable. go to the join query;
 			// conditions prefixed with mainTable. go to the main query;
 			// unqualified conditions default to the join table (most common case).
@@ -288,7 +288,7 @@ final class Handler extends BaseHandlerWithClient
 					// Strip ALL occurrences of the main-table prefix
 					$mainTableConditions[] = trim(str_ireplace($mainTable . '.', '', $condTrimmed));
 				} elseif (!$hasJoin && !$hasMain) {
-					// Unqualified → join table by convention
+					// Unqualified -> join table by convention
 					$joinTableConditions[] = $condTrimmed;
 				}
 				// Mixed-table OR (both prefixes in one token) is skipped:
@@ -303,7 +303,7 @@ final class Handler extends BaseHandlerWithClient
 			);
 
 			// ==================================================================
-			// STEP 3 – PARSE SELECT LIST
+			// STEP 3 - PARSE SELECT LIST
 			// Categorise each item as: COUNT(*), aggregate, join-table field,
 			// or main-table field.
 			// ==================================================================
@@ -364,7 +364,7 @@ final class Handler extends BaseHandlerWithClient
 					continue;
 				}
 
-				// Plain column name [AS alias] without table prefix – skip (ambiguous without schema)
+				// Plain column name [AS alias] without table prefix - skip (ambiguous without schema)
 			}
 
 			// Mode: aggregation when COUNT(*) or GROUP BY is present
@@ -381,7 +381,7 @@ final class Handler extends BaseHandlerWithClient
 			);
 
 			// ==================================================================
-			// STEP 4 – DETERMINE JOIN TABLE COLUMNS TO FETCH
+			// STEP 4 - DETERMINE JOIN TABLE COLUMNS TO FETCH
 			// ==================================================================
 
 			$joinFetchCols = [$joinField];
@@ -406,7 +406,7 @@ final class Handler extends BaseHandlerWithClient
 			}
 
 			// ==================================================================
-			// STEP 5 – EXECUTE JOIN TABLE QUERY
+			// STEP 5 - EXECUTE JOIN TABLE QUERY
 			// ==================================================================
 
 			$joinSelectStr = implode(', ', $joinFetchCols);
@@ -425,12 +425,12 @@ final class Handler extends BaseHandlerWithClient
 			file_put_contents($logFile, '  Join table rows returned: ' . count($joinRows) . "\n", FILE_APPEND);
 
 			if (empty($joinRows)) {
-				file_put_contents($logFile, "  Empty join result – returning empty\n", FILE_APPEND);
+				file_put_contents($logFile, "  Empty join result - returning empty\n", FILE_APPEND);
 				return TaskResult::withData([]);
 			}
 
 			// ==================================================================
-			// STEP 6 – BUILD LOOKUP MAPS FROM JOIN TABLE RESULTS
+			// STEP 6 - BUILD LOOKUP MAPS FROM JOIN TABLE RESULTS
 			// ==================================================================
 
 			$catRows      = [];      // index (0,1,2,...) => full row
@@ -457,7 +457,7 @@ final class Handler extends BaseHandlerWithClient
 			);
 
 			if (empty($allKeywords)) {
-				file_put_contents($logFile, "  No keywords found – returning empty\n", FILE_APPEND);
+				file_put_contents($logFile, "  No keywords found - returning empty\n", FILE_APPEND);
 				return TaskResult::withData([]);
 			}
 
@@ -469,7 +469,7 @@ final class Handler extends BaseHandlerWithClient
 			$mainWhereStr     = 'WHERE ' . implode(' AND ', $mainWhereParts);
 
 			// ==================================================================
-			// MODE A – AGGREGATION (COUNT(*) / GROUP BY)
+			// MODE A - AGGREGATION (COUNT(*) / GROUP BY)
 			// Uses SUM(mvaField IN (kw1,...)) per join-table row.
 			// Manticore returns a single aggregate row; we expand it back.
 			// ==================================================================
@@ -620,7 +620,7 @@ final class Handler extends BaseHandlerWithClient
 			}
 
 			// ==================================================================
-			// MODE B – ROW QUERY (individual rows; main-table fields in SELECT)
+			// MODE B - ROW QUERY (individual rows; main-table fields in SELECT)
 			// Fetches main table rows then expands MVA values to one result row
 			// per (article, matching-category) pair.
 			// ==================================================================
