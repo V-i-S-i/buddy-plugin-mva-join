@@ -476,8 +476,12 @@ public function run(): Task
                 file_put_contents($logFile, "  No keywords found - returning empty\n", FILE_APPEND);
                 return TaskResult::withData([]);
             }
-    
-            $allKwList = implode(',', $allKeywords);
+
+            // Quote helper: numeric values are inlined as-is; strings get single-quoted.
+            // Prevents SQL errors when the join field holds non-integer values.
+            $quoteKw = static fn($k) => is_numeric($k) ? $k : "'" . addslashes((string)$k) . "'";
+
+            $allKwList = implode(',', array_map($quoteKw, $allKeywords));
     
             // Build the main-table WHERE string
             $mainWhereParts = $mainTableConditions;
@@ -505,7 +509,7 @@ public function run(): Task
                 $validIdxs = [];
     
                 foreach ($catRows as $idx => $catRow) {
-                    $kwList = implode(',', $catKeywords[$idx]);
+                    $kwList = implode(',', array_map($quoteKw, $catKeywords[$idx]));
                     if ($kwList === '') {
                         continue;
                     }
@@ -547,7 +551,7 @@ public function run(): Task
                 $catMainData = [];
                 if ($needPerCategoryQuery && !empty($matchedIdxMap)) {
                     foreach (array_keys($matchedIdxMap) as $idx) {
-                        $kwList = implode(',', $catKeywords[$idx]);
+                        $kwList = implode(',', array_map($quoteKw, $catKeywords[$idx]));
                         if ($kwList === '') {
                             continue;
                         }
