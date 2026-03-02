@@ -10,6 +10,7 @@ namespace Manticoresearch\Buddy\Plugin\MvaJoin;
 
 use Manticoresearch\Buddy\Core\ManticoreSearch\Client as HTTPClient;
 use Manticoresearch\Buddy\Core\Plugin\BaseHandlerWithClient;
+use Manticoresearch\Buddy\Core\Task\Column;
 use Manticoresearch\Buddy\Core\Task\Task;
 use Manticoresearch\Buddy\Core\Task\TaskResult;
 use RuntimeException;
@@ -505,7 +506,12 @@ final class Handler extends BaseHandlerWithClient
 				}
 
 				file_put_contents($logFile, '  Returning ' . count($resultRows) . " rows (aggregation mode)\n\n", FILE_APPEND);
-				return TaskResult::withData($resultRows);
+				$result = TaskResult::withData($resultRows);
+				foreach (array_keys($resultRows[0] ?? []) as $colName) {
+					$val = $resultRows[0][$colName] ?? null;
+					$result->column($colName, is_int($val) ? Column::Long : Column::String);
+				}
+				return $result;
 			}
 
 			// ==================================================================
@@ -577,7 +583,12 @@ final class Handler extends BaseHandlerWithClient
 			}
 
 			file_put_contents($logFile, '  Returning ' . count($resultRows) . " rows (row mode)\n\n", FILE_APPEND);
-			return TaskResult::withData($resultRows);
+			$result = TaskResult::withData($resultRows);
+			foreach (array_keys($resultRows[0] ?? []) as $colName) {
+				$val = $resultRows[0][$colName] ?? null;
+				$result->column($colName, is_int($val) ? Column::Long : Column::String);
+			}
+			return $result;
 		};
 
 		return Task::create($taskFn, [$this->payload, $this->manticoreClient])->run();
