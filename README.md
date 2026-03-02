@@ -108,11 +108,16 @@ The plugin implements **INNER JOIN** semantics: join-table rows with zero matchi
 
 ## Limitations
 
-- Join-table fetch is capped at **10,000 rows**.
-- Main-table fetch (Mode B) is capped at **50,000 rows**.
+- Join-table fetch is capped at **10,000 rows**. A warning is emitted via `trigger_error` when the cap is hit.
+- Main-table fetch (Mode B) is capped at **50,000 rows**. A warning is emitted when the cap is hit.
+- When no `LIMIT` is specified, Manticore returns at most **20 rows** by default. Add an explicit `LIMIT` to get more results.
+- The `LIMIT` multiplier heuristic (`LIMIT n` → fetch `n × 100` main-table rows) may be insufficient when one main-table row expands into many join-table matches. If results appear truncated, increase the LIMIT or rely on the 50,000-row cap.
 - Unqualified column names (without a `table.` prefix) in the SELECT list are ignored, as they are ambiguous.
 - `OR` conditions that reference columns from both tables in a single clause cannot be automatically routed and are silently dropped.
-- Aggregates on join-table columns (e.g. `SUM(categories.weight)`) are not supported.
+- Aggregates on join-table columns (e.g. `SUM(categories.weight)`) are not supported — an error is returned.
+- **`HAVING` is not supported.** A `HAVING` clause is silently ignored and will produce incorrect results. *(TODO: detect and raise an error)*
+- **Large join tables and aggregation query size.** In Mode A, one `SUM(mvaField IN (...))` expression is generated per matched join-table row. With hundreds of rows and many keywords, the resulting SQL string can grow very large. A pre-filter step reduces this in practice, but pathological cases may still hit Manticore's query-length limit. *(TODO: chunk into batches of N rows)*
+- **Debug logging in production.** `Payload::hasMatch()` writes to `/tmp/mva-join-debug.log` on every query forwarded to the plugin. In high-traffic environments this causes significant disk I/O. *(TODO: gate behind an env var or constant)*
 
 ## Installation
 
