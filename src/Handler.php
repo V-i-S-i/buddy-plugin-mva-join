@@ -348,6 +348,11 @@ function run(): Task
                             'sqlAlias' => '_agg_' . count($mainTableAggExprs),
                         ];
                         $selectOrder[] = ['type' => 'agg', 'idx' => count($mainTableAggExprs) - 1];
+                    } elseif (strcasecmp($tblPrefix, $joinTable) === 0) {
+                        throw new RuntimeException(
+                            "MVA JOIN: aggregate functions on join-table columns are not supported (got: {$part}). "
+                            . 'Use a subquery or pre-aggregate the join table instead.'
+                        );
                     }
                 }
                 continue;
