@@ -441,7 +441,13 @@ function run(): Task
             throw new RuntimeException('MVA JOIN: join table query failed: ' . $joinResponse->getError());
         }
         $joinRows = $joinResponse->getData();
-        file_put_contents($logFile, '  Join table rows returned: ' . count($joinRows) . "\n", FILE_APPEND);
+        $joinRowCount = count($joinRows);
+        file_put_contents($logFile, '  Join table rows returned: ' . $joinRowCount . "\n", FILE_APPEND);
+
+        if ($joinRowCount >= 10000) {
+            file_put_contents($logFile, "  WARNING: join table result was capped at 10000 rows - results may be incomplete\n", FILE_APPEND);
+            trigger_error('MVA JOIN: join table result capped at 10000 rows; results may be incomplete', E_USER_WARNING);
+        }
 
         if (empty($joinRows)) {
             file_put_contents($logFile, "  Empty join result - returning empty\n", FILE_APPEND);
@@ -748,7 +754,12 @@ function run(): Task
                 throw new RuntimeException('MVA JOIN: main table query failed: ' . $mainResponse->getError());
             }
             $articleRows = $mainResponse->getData();
-            file_put_contents($logFile, '  Main table rows: ' . count($articleRows) . "\n", FILE_APPEND);
+            $articleRowCount = count($articleRows);
+            file_put_contents($logFile, '  Main table rows: ' . $articleRowCount . "\n", FILE_APPEND);
+            if ($articleRowCount >= $fetchLimit) {
+                file_put_contents($logFile, "  WARNING: main table result was capped at {$fetchLimit} rows - results may be incomplete\n", FILE_APPEND);
+                trigger_error("MVA JOIN: main table result capped at {$fetchLimit} rows; results may be incomplete", E_USER_WARNING);
+            }
     
             // Expand: one output row per (article, matching join-table row)
             $resultRows = [];
