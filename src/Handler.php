@@ -356,31 +356,47 @@ function run(): Task
                 continue;
             }
 
-            // Aggregate functions on main-table fields: SUM(t.col), AVG(t.col), GROUP_CONCAT(t.col)
+            // Aggregate functions: pass expression through to Manticore verbatim after stripping
+            // the main-table name prefix. Handles SUM(col), GROUP_CONCAT(DISTINCT col),
+            // GROUP_CONCAT(FUNC(col)), conditional expressions, etc. without needing to parse
+            // the inner structure.
             if (preg_match('/^(SUM|AVG|MIN|MAX|GROUP_CONCAT)\s*\(/i', $part)) {
-                if (preg_match(
-                    '/^(SUM|AVG|MIN|MAX|GROUP_CONCAT)\s*\(\s*(?:(\w+)\.)?\s*(\w+)\s*\)(?:\s+AS\s+(\w+))?$/i',
-                    $part, $mm
-                )) {
-                    $tblPrefix = $mm[2] ?? '';
-                    $col = $mm[3];
-                    $alias = isset($mm[4]) && $mm[4] !== '' ? $mm[4] : null;
-                    if ($tblPrefix === '' || strcasecmp($tblPrefix, $mainTable) === 0) {
-                        $mainTableAggExprs[] = [
-                            'func' => strtoupper($mm[1]),
-                            'column' => $col,
-                            'outputName' => $alias ?? $part,
-                            'sqlExpr' => strtoupper($mm[1]) . "({$col})",
-                            'sqlAlias' => '_agg_' . count($mainTableAggExprs),
-                        ];
-                        $selectOrder[] = ['type' => 'agg', 'idx' => count($mainTableAggExprs) - 1];
-                    } elseif (strcasecmp($tblPrefix, $joinTable) === 0) {
-                        throw new RuntimeException(
-                            "MVA JOIN: aggregate functions on join-table columns are not supported (got: {$part}). "
-                            . 'Use a subquery or pre-aggregate the join table instead.'
-                        );
-                    }
+                $alias = null;
+                $rawExpr = $part;
+                if (preg_match('/^(.*\))\s+AS\s+(\w+)\s*$/is', $part, $am)) {
+                    $rawExpr = trim($am[1]);
+                    $alias = $am[2];
                 }
+                if (stripos($rawExpr, $joinTable . '.') !== false) {
+                    throw new RuntimeException(
+                        "MVA JOIN: aggregate functions on join-table columns are not supported (got: {$part}). "
+                        . 'Use a subquery or pre-aggregate the join table instead.'
+                    );
+                }
+                $sqlExpr = str_ireplace($mainTable . '.', '', $rawExpr);
+                // GROUP_CONCAT(DISTINCT col): Manticore does not support DISTINCT inside
+                // GROUP_CONCAT. Strip DISTINCT from the SQL and deduplicate in PHP.
+                $dedup = false;
+                if (preg_match('/^GROUP_CONCAT\s*\(\s*DISTINCT\s+/i', $sqlExpr)) {
+                    $sqlExpr = preg_replace('/^(GROUP_CONCAT\s*\(\s*)DISTINCT\s+/i', '$1', $sqlExpr);
+                    $dedup = true;
+                }
+                // Nested function calls inside GROUP_CONCAT are not supported by Manticore.
+                if (preg_match('/^GROUP_CONCAT\s*\(\s*\w+\s*\(/i', $sqlExpr)) {
+                    throw new RuntimeException(
+                        "MVA JOIN: GROUP_CONCAT with nested function calls is not supported by Manticore "
+                        . "(got: {$part}). Use GROUP_CONCAT(col) without inner functions."
+                    );
+                }
+                $mainTableAggExprs[] = [
+                    'func'      => 'PASSTHROUGH',
+                    'column'    => '',
+                    'outputName'=> $alias ?? $part,
+                    'sqlExpr'   => $sqlExpr,
+                    'sqlAlias'  => '_agg_' . count($mainTableAggExprs),
+                    'dedup'     => $dedup,
+                ];
+                $selectOrder[] = ['type' => 'agg', 'idx' => count($mainTableAggExprs) - 1];
                 continue;
             }
 
@@ -396,6 +412,12 @@ function run(): Task
                     $mainTableSelectFields[] = ['column' => $col, 'alias' => $alias];
                     $selectOrder[] = ['type' => 'raw', 'idx' => count($mainTableSelectFields) - 1];
                 }
+                continue;
+            }
+
+            // String literal: 'value' [AS alias]
+            if (preg_match("/^'([^']*)'(?:\\s+AS\\s+(\\w+))?$/i", $part, $mm)) {
+                $selectOrder[] = ['type' => 'literal', 'value' => $mm[1], 'outputName' => $mm[2] ?? "'{$mm[1]}'"];
                 continue;
             }
 
@@ -747,13 +769,20 @@ function run(): Task
                                     break;
                                 case 'agg':
                                     $agg = $mainTableAggExprs[$spec['idx']];
-                                    $row[$agg['outputName']] = $mainRow[$agg['sqlAlias']] ?? null;
+                                    $val = $mainRow[$agg['sqlAlias']] ?? null;
+                                    if (!empty($agg['dedup']) && is_string($val) && $val !== '') {
+                                        $val = implode(',', array_unique(array_map('trim', explode(',', $val))));
+                                    }
+                                    $row[$agg['outputName']] = $val;
                                     break;
                                 case 'raw':
                                     $f = $mainTableSelectFields[$spec['idx']];
                                     $colName = $f['alias'] ?? $f['column'];
                                     // main-table column keeps the bare name on conflict
                                     $row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
+                                    break;
+                                case 'literal':
+                                    $row[$spec['outputName']] = $spec['value'];
                                     break;
                             }
                         }
