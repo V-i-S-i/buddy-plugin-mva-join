@@ -368,6 +368,21 @@ public function run(): Task
                 // Plain column name [AS alias] without table prefix - skip (ambiguous without schema)
             }
     
+            // Detect output-column name conflicts between the two tables.
+            // When the same bare name (no alias) appears in both $joinTableSelectFields
+            // and $mainTableSelectFields the two writes collide on the same PHP array key.
+            // Resolution: prefix the conflicting names with "{table}_".
+            $colConflicts = [];
+            foreach ($joinTableSelectFields as $jf) {
+                $jName = $jf['alias'] ?? $jf['column'];
+                foreach ($mainTableSelectFields as $mf) {
+                    $mName = $mf['alias'] ?? $mf['column'];
+                    if ($jName === $mName) {
+                        $colConflicts[$jName] = true;
+                    }
+                }
+            }
+
             // Mode: aggregation when COUNT(*) or GROUP BY is present
             $isAggregation = $hasCountStar || $groupBy !== '';
     
@@ -619,6 +634,9 @@ public function run(): Task
                                 case 'join':
                                     $f = $joinTableSelectFields[$spec['idx']];
                                     $colName = $f['alias'] ?? $f['column'];
+                                    if ($f['alias'] === null && isset($colConflicts[$colName])) {
+                                        $colName = $joinTable . '.' . $f['column'];
+                                    }
                                     $row[$colName] = $catRow[$f['column']] ?? null;
                                     break;
                                 case 'agg':
@@ -628,6 +646,7 @@ public function run(): Task
                                 case 'raw':
                                     $f = $mainTableSelectFields[$spec['idx']];
                                     $colName = $f['alias'] ?? $f['column'];
+                                    // main-table column keeps the bare name on conflict
                                     $row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
                                     break;
                             }
@@ -667,7 +686,7 @@ public function run(): Task
                 }
             }
     
-            $mainSelectStr = implode(', ', $mainFetchCols);
+            $mainSelectStr = $selectStar ? '*' : implode(', ', $mainFetchCols);
             // Fetch enough rows to cover the requested LIMIT after expansion.
             // Default cap of 50,000 prevents runaway memory usage.
             $fetchLimit = $limitCount > 0 ? min($limitCount * 100, 50000) : 50000;
@@ -701,13 +720,31 @@ public function run(): Task
                     $catRow = $catRows[$idx];
                     $row = [];
     
-                    foreach ($mainTableSelectFields as $f) {
-                        $colName = $f['alias'] ?? $f['column'];
-                        $row[$colName] = $artRow[$f['column']] ?? null;
-                    }
-                    foreach ($joinTableSelectFields as $f) {
-                        $colName = $f['alias'] ?? $f['column'];
-                        $row[$colName] = $catRow[$f['column']] ?? null;
+                    if ($selectStar) {
+                        // All main-table columns except the raw MVA field
+                        foreach ($artRow as $col => $val) {
+                            if ($col !== $mvaField) {
+                                $row[$col] = $val;
+                            }
+                        }
+                        // All join-table columns; qualify name if it collides with main-table
+                        foreach ($catRow as $col => $val) {
+                            $colName = isset($row[$col]) ? $joinTable . '.' . $col : $col;
+                            $row[$colName] = $val;
+                        }
+                    } else {
+                        foreach ($mainTableSelectFields as $f) {
+                            $colName = $f['alias'] ?? $f['column'];
+                            // main-table column keeps the bare name on conflict
+                            $row[$colName] = $artRow[$f['column']] ?? null;
+                        }
+                        foreach ($joinTableSelectFields as $f) {
+                            $colName = $f['alias'] ?? $f['column'];
+                            if ($f['alias'] === null && isset($colConflicts[$colName])) {
+                                $colName = $joinTable . '.' . $f['column'];
+                            }
+                            $row[$colName] = $catRow[$f['column']] ?? null;
+                        }
                     }
                     $resultRows[] = $row;
                 }
