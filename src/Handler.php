@@ -192,6 +192,7 @@ final class Handler extends BaseHandlerWithClient
 				throw new RuntimeException('MVA JOIN plugin: failed to parse SELECT list');
 			}
 			$selectList = trim($m[1]);
+			$selectStar = ($selectList === '*');
 
 			// Main table (FROM) and join table (MVA JOIN)
 			if (!preg_match('/\bFROM\s+(\w+)\s+MVA\s+JOIN\s+(\w+)\b/i', $query, $m)) {
@@ -468,6 +469,16 @@ final class Handler extends BaseHandlerWithClient
 			$mainWhereParts[] = "{$mvaField} IN ({$allKwList})";
 			$mainWhereStr     = 'WHERE ' . implode(' AND ', $mainWhereParts);
 
+			// SELECT * - join-table columns read from $catRows at result time;
+			// main-table columns fetched via SELECT * per-category (avoids unsupported-type issues)
+			if ($selectStar) {
+				if ($isAggregation && !$hasCountStar) {
+					$hasCountStar = true;
+				}
+				$needPerCategoryQuery = true;
+				file_put_contents($logFile, "  SELECT *: resolving columns at runtime\n", FILE_APPEND);
+			}
+
 			// ==================================================================
 			// MODE A - AGGREGATION (COUNT(*) / GROUP BY)
 			// Uses SUM(mvaField IN (kw1,...)) per join-table row.
@@ -566,6 +577,18 @@ final class Handler extends BaseHandlerWithClient
 							}
 						}
 
+						// SELECT * - fetch all main-table columns; silently skip unsupported-type errors
+						if ($selectStar) {
+							$starQuery = "SELECT * FROM {$mainTable} {$catWhereStr} LIMIT 1";
+							file_put_contents($logFile, "  [Per-cat star idx={$idx}]: " . substr($starQuery, 0, 500) . "\n", FILE_APPEND);
+							$starResp = $manticoreClient->sendRequest($starQuery);
+							if (!$starResp->hasError()) {
+								$catRow = array_merge($catRow, $starResp->getData()[0] ?? []);
+							} else {
+								file_put_contents($logFile, "  [Per-cat star ERR idx={$idx}]: " . $starResp->getError() . "\n", FILE_APPEND);
+							}
+						}
+
 						$catMainData[$idx] = $catRow;
 						file_put_contents($logFile, "  [Per-cat result idx={$idx}]: " . json_encode($catRow) . "\n", FILE_APPEND);
 					}
@@ -577,25 +600,37 @@ final class Handler extends BaseHandlerWithClient
 					$catRow  = $catRows[$idx];
 					$mainRow = $needPerCategoryQuery ? ($catMainData[$idx] ?? []) : [];
 					$row     = [];
-					foreach ($selectOrder as $spec) {
-						switch ($spec['type']) {
-							case 'count':
-								$row[$countStarAlias] = $count;
-								break;
-							case 'join':
-								$f       = $joinTableSelectFields[$spec['idx']];
-								$colName = $f['alias'] ?? $f['column'];
-								$row[$colName] = $catRow[$f['column']] ?? null;
-								break;
-							case 'agg':
-								$agg = $mainTableAggExprs[$spec['idx']];
-								$row[$agg['outputName']] = $mainRow[$agg['sqlAlias']] ?? null;
-								break;
-							case 'raw':
-								$f       = $mainTableSelectFields[$spec['idx']];
-								$colName = $f['alias'] ?? $f['column'];
-								$row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
-								break;
+					if ($selectStar) {
+						foreach ($catRow as $col => $val) {
+							$row[$col] = $val;
+						}
+						$row[$countStarAlias] = $count;
+						foreach ($mainRow as $col => $val) {
+							if ($col !== $mvaField) {
+								$row[$col] = $val;
+							}
+						}
+					} else {
+						foreach ($selectOrder as $spec) {
+							switch ($spec['type']) {
+								case 'count':
+									$row[$countStarAlias] = $count;
+									break;
+								case 'join':
+									$f       = $joinTableSelectFields[$spec['idx']];
+									$colName = $f['alias'] ?? $f['column'];
+									$row[$colName] = $catRow[$f['column']] ?? null;
+									break;
+								case 'agg':
+									$agg = $mainTableAggExprs[$spec['idx']];
+									$row[$agg['outputName']] = $mainRow[$agg['sqlAlias']] ?? null;
+									break;
+								case 'raw':
+									$f       = $mainTableSelectFields[$spec['idx']];
+									$colName = $f['alias'] ?? $f['column'];
+									$row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
+									break;
+							}
 						}
 					}
 					$resultRows[] = $row;
