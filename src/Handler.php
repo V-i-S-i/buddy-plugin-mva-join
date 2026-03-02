@@ -275,8 +275,6 @@ public function run(): Task
     
             $joinTableConditions = [];
             $mainTableConditions = [];
-            $joinTablePrefix = strtolower($joinTable) . '.';
-            $mainTablePrefix = strtolower($mainTable) . '.';
     
             foreach ($splitWhereByAnd($whereClause) as $cond) {
                 $condTrimmed = trim($cond);
