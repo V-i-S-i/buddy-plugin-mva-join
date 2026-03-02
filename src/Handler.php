@@ -620,14 +620,17 @@ public function run(): Task
                     $mainRow = $needPerCategoryQuery ? ($catMainData[$idx] ?? []) : [];
                     $row = [];
                     if ($selectStar) {
-                        foreach ($catRow as $col => $val) {
-                            $row[$col] = $val;
-                        }
-                        $row[$countStarAlias] = $count;
+                        // Main-table columns first (they keep the bare name on conflict)
                         foreach ($mainRow as $col => $val) {
                             if ($col !== $mvaField) {
                                 $row[$col] = $val;
                             }
+                        }
+                        $row[$countStarAlias] = $count;
+                        // Join-table columns: qualify name if it collides with a main-table column
+                        foreach ($catRow as $col => $val) {
+                            $colName = isset($row[$col]) ? $joinTable . '.' . $col : $col;
+                            $row[$colName] = $val;
                         }
                     } else {
                         foreach ($selectOrder as $spec) {
