@@ -411,7 +411,7 @@ function run(): Task
             }
         }
 
-        // Also fetch any GROUP BY fields that reference the join table
+        // Also fetch any GROUP BY fields that reference the join table or main table
         if ($groupBy) {
             foreach ($splitByComma($groupBy) as $gbPart) {
                 $gbPart = trim($gbPart);
@@ -419,6 +419,20 @@ function run(): Task
                     [$gbTable, $gbCol] = explode('.', $gbPart, 2);
                     if (strcasecmp($gbTable, $joinTable) === 0 && !in_array($gbCol, $joinFetchCols, true)) {
                         $joinFetchCols[] = $gbCol;
+                    } elseif (strcasecmp($gbTable, $mainTable) === 0) {
+                        // Ensure this column is included in mainTableSelectFields so it
+                        // gets fetched in per-cat raw queries (Mode A) and Mode B fetches.
+                        $alreadyInSelect = false;
+                        foreach ($mainTableSelectFields as $mf) {
+                            if ($mf['column'] === $gbCol) {
+                                $alreadyInSelect = true;
+                                break;
+                            }
+                        }
+                        if (!$alreadyInSelect) {
+                            $mainTableSelectFields[] = ['column' => $gbCol, 'alias' => null];
+                            $selectOrder[] = ['type' => 'raw', 'idx' => count($mainTableSelectFields) - 1];
+                        }
                     }
                 }
             }
