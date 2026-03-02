@@ -160,16 +160,20 @@ public function run(): Task
                         $dir = strtoupper($dm[1]);
                         $part = trim(substr($part, 0, -strlen($dm[0])));
                     }
-                    // Strip optional table prefix (e.g. categories.name -> name)
+                    // Bare field name (table prefix stripped); also keep the qualified
+                    // form (e.g. 'categories.id') in case the result column was renamed.
+                    $qualified = $part;
                     if (str_contains($part, '.')) {
                         [, $part] = explode('.', $part, 2);
                     }
-                    $specs[] = ['field' => $part, 'dir' => $dir];
+                    $specs[] = ['field' => $part, 'qualified' => $qualified, 'dir' => $dir];
                 }
                 usort($rows, static function ($a, $b) use ($specs) {
                     foreach ($specs as $s) {
-                        $va = $a[$s['field']] ?? null;
-                        $vb = $b[$s['field']] ?? null;
+                        // The result column may be bare ('id') or qualified ('categories.id').
+                        // Try bare name first, then the qualified form stored in 'qualified'.
+                        $va = array_key_exists($s['field'], $a) ? $a[$s['field']] : ($a[$s['qualified']] ?? null);
+                        $vb = array_key_exists($s['field'], $b) ? $b[$s['field']] : ($b[$s['qualified']] ?? null);
                         if ($va === $vb) {
                             continue;
                         }
