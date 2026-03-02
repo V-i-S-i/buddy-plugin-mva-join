@@ -229,7 +229,8 @@ final class Handler extends BaseHandlerWithClient
 			// WHERE clause (stop before GROUP BY / ORDER BY / LIMIT / HAVING)
 			$whereClause = '';
 			if (preg_match('/\bWHERE\s+(.*?)(?=\s+(?:GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING)\b|$)/is', $query, $m)) {
-				$whereClause = trim($m[1]);
+				// Collapse newlines/tabs to spaces so the AND splitter always sees ' AND '
+				$whereClause = trim(preg_replace('/\s+/', ' ', $m[1]));
 			}
 
 			// GROUP BY
@@ -277,16 +278,21 @@ final class Handler extends BaseHandlerWithClient
 			$mainTablePrefix     = strtolower($mainTable) . '.';
 
 			foreach ($splitWhereByAnd($whereClause) as $cond) {
-				$condLower = strtolower(trim($cond));
-				if (str_starts_with($condLower, $joinTablePrefix)) {
-					// Strip the "joinTable." prefix before sending to the join query
-					$joinTableConditions[] = substr(trim($cond), strlen($joinTable) + 1);
-				} elseif (str_starts_with($condLower, $mainTablePrefix)) {
-					$mainTableConditions[] = substr(trim($cond), strlen($mainTable) + 1);
-				} else {
+				$condTrimmed = trim($cond);
+				$hasJoin     = stripos($condTrimmed, $joinTable . '.') !== false;
+				$hasMain     = stripos($condTrimmed, $mainTable . '.') !== false;
+				if ($hasJoin && !$hasMain) {
+					// Strip ALL occurrences of the join-table prefix
+					$joinTableConditions[] = trim(str_ireplace($joinTable . '.', '', $condTrimmed));
+				} elseif ($hasMain && !$hasJoin) {
+					// Strip ALL occurrences of the main-table prefix
+					$mainTableConditions[] = trim(str_ireplace($mainTable . '.', '', $condTrimmed));
+				} elseif (!$hasJoin && !$hasMain) {
 					// Unqualified → join table by convention
-					$joinTableConditions[] = trim($cond);
+					$joinTableConditions[] = $condTrimmed;
 				}
+				// Mixed-table OR (both prefixes in one token) is skipped:
+				// cannot be cleanly routed to either single-table query.
 			}
 
 			file_put_contents(
