@@ -151,7 +151,7 @@ The plugin implements **INNER JOIN** semantics: join-table rows with zero matchi
 - Multi-condition ON clause: all ON conditions must reference the **same join-table field** (`joinField`). Conditions with different join-table fields are not currently supported.
 - **`HAVING` is not supported.** A `HAVING` clause is silently ignored and will produce incorrect results. *(TODO: detect and raise an error)*
 - **Large join tables and aggregation query size.** In Mode A, one `SUM(mvaField IN (...))` expression is generated per matched join-table row. With hundreds of rows and many keywords, the resulting SQL string can grow very large. A pre-filter step reduces this in practice, but pathological cases may still hit Manticore's query-length limit. *(TODO: chunk into batches of N rows)*
-- **Debug logging in production.** `Payload::hasMatch()` writes to `/tmp/mva-join-debug.log` on every query forwarded to the plugin. In high-traffic environments this causes significant disk I/O. *(TODO: gate behind an env var or constant)*
+- **Debug logging** is gated behind `--log-level=debug[v[v]]` — no disk I/O in normal production operation.
 
 ## Installation
 
