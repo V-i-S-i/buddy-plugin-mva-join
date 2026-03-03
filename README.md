@@ -38,7 +38,7 @@ The `ON` clause must link the MVA field(s) on the main table to the correspondin
 | `GROUP_CONCAT(DISTINCT col)` | `GROUP_CONCAT(DISTINCT articles.feed_id) AS feeds` | `DISTINCT` is stripped before sending to Manticore; deduplication is done in PHP |
 | `GROUP_CONCAT(FUNC(...))` | `GROUP_CONCAT(SNIPPET(articles.content, QUERY(), 'around=40')) AS snips` | Nested function calls unsupported by Manticore are simulated in PHP: the inner expression is fetched per-category and the results are concatenated |
 | MVA cross-field count | `SUM(articles.neutral_kw_id IN (categories.keyword_id))` | Counts articles where a second MVA field contains the current category's keyword |
-| Arbitrary function | `SNIPPET(articles.content, QUERY()) AS snip` | Any function expression — `SNIPPET`, `WEIGHT()`, `GEODIST()`, etc. — is passed verbatim to the main-table query after stripping the table prefix |
+| Arbitrary function | `SNIPPET(articles.content, QUERY()) AS snip` | Any function expression — `SNIPPET`, `WEIGHT()`, `GEODIST()`, etc. — is passed verbatim to the main-table query after stripping the table prefix. Join-table column references (e.g. `categories.category_name`) are substituted with the actual per-row value at runtime |
 | String literal | `'label' AS col` | Fixed value repeated in every result row |
 
 Column order in the result set matches the order in the SELECT list.
@@ -116,12 +116,23 @@ SELECT *
 FROM articles
 MVA JOIN categories ON articles.keyword_id = categories.keyword_id
 WHERE categories.customer_id = 7037;
+
+-- SNIPPET using the category name as the search term (substituted per row)
+SELECT
+    categories.id, categories.category_name,
+    articles_today_lt.id AS article_id,
+    SNIPPET(articles_today_lt.content, categories.category_name, 'around=40', 'limit=200', 'snippet_boundary=sentence') AS snip
+FROM articles_today_lt
+MVA JOIN categories ON articles_today_lt.keyword_id = categories.keyword_id
+WHERE categories.customer_id = 7037 AND MATCH('keyword')
+LIMIT 100;
 ```
 
 Internally:
 1. Fetches all join-table rows matching the WHERE.
-2. Fetches matching main-table rows (capped at 50,000).
-3. Expands each main-table row's MVA values into one output row per matching join-table row.
+2. Fetches matching main-table rows (capped at 50,000). Expressions that reference join-table columns are excluded from this bulk fetch.
+3. For each matched category, runs one targeted query to evaluate the per-category expressions (e.g. SNIPPET with a per-category search term) for the relevant article IDs.
+4. Expands each main-table row's MVA values into one output row per matching join-table row, merging per-category expression values.
 
 ## JOIN semantics
 
@@ -136,7 +147,7 @@ The plugin implements **INNER JOIN** semantics: join-table rows with zero matchi
 - Unqualified column names (without a `table.` prefix) in the SELECT list are ignored, as they are ambiguous.
 - `OR` conditions that reference columns from both tables in a single clause cannot be automatically routed and are silently dropped.
 - Aggregates on join-table columns (e.g. `SUM(categories.weight)`) are not supported — an error is returned.
-- `GROUP_CONCAT` with nested function calls (e.g. `GROUP_CONCAT(SNIPPET(...))`) is simulated in PHP (Mode A only). One extra query per matched category is issued to collect the inner expression's values, which may be slow for large result sets.
+- `GROUP_CONCAT` with nested function calls (e.g. `GROUP_CONCAT(SNIPPET(...))`) is simulated in PHP. One extra query per matched category is issued to collect the inner expression's values, which may be slow for large result sets.
 - Multi-condition ON clause: all ON conditions must reference the **same join-table field** (`joinField`). Conditions with different join-table fields are not currently supported.
 - **`HAVING` is not supported.** A `HAVING` clause is silently ignored and will produce incorrect results. *(TODO: detect and raise an error)*
 - **Large join tables and aggregation query size.** In Mode A, one `SUM(mvaField IN (...))` expression is generated per matched join-table row. With hundreds of rows and many keywords, the resulting SQL string can grow very large. A pre-filter step reduces this in practice, but pathological cases may still hit Manticore's query-length limit. *(TODO: chunk into batches of N rows)*
