@@ -309,8 +309,14 @@ function run(): Task
                 // Strip ALL occurrences of the main-table prefix
                 $mainTableConditions[] = trim(str_ireplace($mainTable . '.', '', $condTrimmed));
             } elseif (!$hasJoin && !$hasMain) {
-                // Unqualified -> join table by convention
-                $joinTableConditions[] = $condTrimmed;
+                // MATCH() without a table prefix always belongs to the main table
+                // (Manticore full-text search; join tables rarely have full-text indexes)
+                if (preg_match('/^\s*MATCH\s*\(/i', $condTrimmed)) {
+                    $mainTableConditions[] = $condTrimmed;
+                } else {
+                    // Unqualified -> join table by convention
+                    $joinTableConditions[] = $condTrimmed;
+                }
             }
             // Mixed-table OR (both prefixes in one token) is skipped:
             // cannot be cleanly routed to either single-table query.
@@ -438,6 +444,30 @@ function run(): Task
                 continue;
             }
 
+            // Arbitrary main-table function expression: SNIPPET(...), WEIGHT(), GEODIST(...), etc.
+            // Strip the main-table prefix from arguments, pass verbatim to the main-table query.
+            // join-table functions are not supported and are silently skipped.
+            if (preg_match('/^\w+\s*\(/i', $part)) {
+                $alias = null;
+                $rawExpr = $part;
+                if (preg_match('/^(.*\))\s+AS\s+(\w+)\s*$/is', $part, $am)) {
+                    $rawExpr = trim($am[1]);
+                    $alias = $am[2];
+                }
+                if (stripos($rawExpr, $joinTable . '.') === false) {
+                    $sqlExpr = str_ireplace($mainTable . '.', '', $rawExpr);
+                    $outputKey = '_fexpr_' . count($mainTableSelectFields);
+                    $mainTableSelectFields[] = [
+                        'column'    => null,      // expression — not a plain column
+                        'expr'      => $sqlExpr,
+                        'alias'     => $alias,
+                        'outputKey' => $outputKey,
+                    ];
+                    $selectOrder[] = ['type' => 'raw', 'idx' => count($mainTableSelectFields) - 1];
+                }
+                continue;
+            }
+
             // Plain column name [AS alias] without table prefix - skip (ambiguous without schema)
         }
 
@@ -449,8 +479,8 @@ function run(): Task
         foreach ($joinTableSelectFields as $jf) {
             $jName = $jf['alias'] ?? $jf['column'];
             foreach ($mainTableSelectFields as $mf) {
-                $mName = $mf['alias'] ?? $mf['column'];
-                if ($jName === $mName) {
+                $mName = $mf['alias'] ?? ($mf['column'] ?? null);
+                if ($mName !== null && $jName === $mName) {
                     $colConflicts[$jName] = true;
                 }
             }
@@ -727,7 +757,11 @@ function run(): Task
                         if (!empty($mainTableSelectFields)) {
                             $rawParts = [];
                             foreach ($mainTableSelectFields as $f) {
-                                $rawParts[] = $f['column'] . ' AS _raw_' . $f['column'];
+                                if (isset($f['expr'])) {
+                                    $rawParts[] = $f['expr'] . ' AS ' . $f['outputKey'];
+                                } else {
+                                    $rawParts[] = $f['column'] . ' AS _raw_' . $f['column'];
+                                }
                             }
                             $rawQuery = 'SELECT ' . implode(', ', $rawParts) . " FROM {$mainTable} {$catWhereStr} LIMIT 1";
                             file_put_contents($logFile, "  [Per-cat raw idx={$idx}]: " . substr($rawQuery, 0, 500) . "\n", FILE_APPEND);
@@ -802,9 +836,14 @@ function run(): Task
                                     break;
                                 case 'raw':
                                     $f = $mainTableSelectFields[$spec['idx']];
-                                    $colName = $f['alias'] ?? $f['column'];
-                                    // main-table column keeps the bare name on conflict
-                                    $row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
+                                    if (isset($f['expr'])) {
+                                        $colName = $f['alias'] ?? $f['expr'];
+                                        $row[$colName] = $mainRow[$f['outputKey']] ?? null;
+                                    } else {
+                                        $colName = $f['alias'] ?? $f['column'];
+                                        // main-table column keeps the bare name on conflict
+                                        $row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
+                                    }
                                     break;
                                 case 'literal':
                                     $row[$spec['outputName']] = $spec['value'];
@@ -847,6 +886,11 @@ function run(): Task
                 }
             }
             foreach ($mainTableSelectFields as $f) {
+                if (isset($f['expr'])) {
+                    // Expression (SNIPPET, WEIGHT, etc.) — always include with its alias
+                    $mainFetchCols[] = $f['expr'] . ' AS ' . $f['outputKey'];
+                    continue;
+                }
                 if (!in_array($f['column'], $mainFetchCols, true)) {
                     $mainFetchCols[] = $f['column'];
                 }
@@ -917,9 +961,14 @@ function run(): Task
                         }
                     } else {
                         foreach ($mainTableSelectFields as $f) {
-                            $colName = $f['alias'] ?? $f['column'];
-                            // main-table column keeps the bare name on conflict
-                            $row[$colName] = $artRow[$f['column']] ?? null;
+                            if (isset($f['expr'])) {
+                                $colName = $f['alias'] ?? $f['expr'];
+                                $row[$colName] = $artRow[$f['outputKey']] ?? null;
+                            } else {
+                                $colName = $f['alias'] ?? $f['column'];
+                                // main-table column keeps the bare name on conflict
+                                $row[$colName] = $artRow[$f['column']] ?? null;
+                            }
                         }
                         foreach ($joinTableSelectFields as $f) {
                             $colName = $f['alias'] ?? $f['column'];
