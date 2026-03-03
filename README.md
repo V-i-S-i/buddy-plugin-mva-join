@@ -68,9 +68,10 @@ Multiple conditions connected by `AND` (including across multiple lines) are spl
 
 ### Mode A — Aggregation (COUNT(\*) or GROUP BY present)
 
-One result row per matched join-table row, with aggregate values.
+One result row per matched join-table row, with aggregate values. When `GROUP BY` references a **main-table column**, the result expands to one row per `(join-table row, group-value)` pair — useful for per-feed or per-source breakdowns within each category.
 
 ```sql
+-- One row per category
 SELECT categories.category_name, categories.id,
        COUNT(*) AS cnt,
        SUM(articles_today_lt.negative_keyword_id IN (categories.keyword_id)) AS cnt_negative,
@@ -83,6 +84,19 @@ FROM articles_today_lt
 MVA JOIN categories
     ON articles_today_lt.keyword_id = categories.keyword_id
 WHERE categories.customer_id = 7037
+LIMIT 100;
+
+-- One row per (category, feed) — GROUP BY main-table column
+SELECT categories.id, categories.category_name,
+       COUNT(*) AS cnt,
+       SUM(articles_today_lt.negative_keyword_id IN (categories.keyword_id)) AS cnt_negative,
+       MIN(articles_today_lt.date_added) AS min_date,
+       articles_today_lt.feed_id
+FROM articles_today_lt
+MVA JOIN categories
+    ON articles_today_lt.keyword_id = categories.keyword_id
+WHERE categories.customer_id = 7037
+GROUP BY articles_today_lt.feed_id
 LIMIT 100;
 ```
 
