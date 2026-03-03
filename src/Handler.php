@@ -942,15 +942,26 @@ function run(): Task
                     $mainFetchCols[] = $cond['mvaField'];
                 }
             }
-            foreach ($mainTableSelectFields as $f) {
+            // Expressions that reference join-table columns need per-category substitution;
+            // exclude them from the bulk fetch and handle separately below.
+            $joinRefExprIdxs = [];
+            foreach ($mainTableSelectFields as $fi => $f) {
                 if (isset($f['expr'])) {
-                    // Expression (SNIPPET, WEIGHT, etc.) — always include with its alias
+                    if (!empty($f['joinRefs'])) {
+                        $joinRefExprIdxs[] = $fi;
+                        continue; // fetched per-category after the bulk fetch
+                    }
                     $mainFetchCols[] = $f['expr'] . ' AS ' . $f['outputKey'];
                     continue;
                 }
                 if (!in_array($f['column'], $mainFetchCols, true)) {
                     $mainFetchCols[] = $f['column'];
                 }
+            }
+            $hasJoinRefExprs = !empty($joinRefExprIdxs);
+            // 'id' is needed to correlate per-category results back to article rows
+            if ($hasJoinRefExprs && !$selectStar && !in_array('id', $mainFetchCols, true)) {
+                $mainFetchCols[] = 'id';
             }
     
             $mainSelectStr = $selectStar ? '*' : implode(', ', $mainFetchCols);
@@ -973,6 +984,54 @@ function run(): Task
                 trigger_error("MVA JOIN: main table result capped at {$fetchLimit} rows; results may be incomplete", E_USER_WARNING);
             }
     
+            // For expressions that reference join-table columns (e.g. SNIPPET(..., categories.name, ...)):
+            // pre-compute category→article-ID map, then run one per-category query per expression.
+            $catExprData = [];  // [catIdx][artId][outputKey] => value
+            if ($hasJoinRefExprs) {
+                $catToArtIds = [];
+                foreach ($articleRows as $artRow) {
+                    $mIdxs = [];
+                    foreach ($extractMva($artRow[$mvaJoinConds[0]['mvaField']] ?? '') as $kw) {
+                        if (isset($kwToCatIdxs[$kw])) {
+                            foreach ($kwToCatIdxs[$kw] as $idx) { $mIdxs[$idx] = true; }
+                        }
+                    }
+                    foreach (array_slice($mvaJoinConds, 1) as $extraCond) {
+                        $extraSet = [];
+                        foreach ($extractMva($artRow[$extraCond['mvaField']] ?? '') as $kw) {
+                            if (isset($kwToCatIdxs[$kw])) {
+                                foreach ($kwToCatIdxs[$kw] as $idx) { $extraSet[$idx] = true; }
+                            }
+                        }
+                        $mIdxs = array_intersect_key($mIdxs, $extraSet);
+                    }
+                    $artId = $artRow['id'] ?? null;
+                    if ($artId !== null) {
+                        foreach (array_keys($mIdxs) as $cidx) {
+                            $catToArtIds[$cidx][] = $artId;
+                        }
+                    }
+                }
+                foreach ($catToArtIds as $catIdx => $artIds) {
+                    $catRow   = $catRows[$catIdx];
+                    $idList   = implode(',', array_unique(array_map('intval', $artIds)));
+                    $exprParts = ['id AS _art_id'];
+                    foreach ($joinRefExprIdxs as $fi) {
+                        $f = $mainTableSelectFields[$fi];
+                        $exprParts[] = $substituteJoinRefs($f['expr'], $f['joinRefs'], $catRow) . ' AS ' . $f['outputKey'];
+                    }
+                    $catExprQuery = 'SELECT ' . implode(', ', $exprParts)
+                        . " FROM {$mainTable} WHERE id IN ({$idList}) LIMIT " . count($artIds);
+                    file_put_contents($logFile, "  [Mode B joinRef cat={$catIdx}]: " . substr($catExprQuery, 0, 500) . "\n", FILE_APPEND);
+                    $catExprResp = $manticoreClient->sendRequest($catExprQuery);
+                    if (!$catExprResp->hasError()) {
+                        foreach ($catExprResp->getData() as $eRow) {
+                            $catExprData[$catIdx][(string)($eRow['_art_id'] ?? '')] = $eRow;
+                        }
+                    }
+                }
+            }
+
             // Expand: one output row per (article, matching join-table row)
             $resultRows = [];
             foreach ($articleRows as $artRow) {
@@ -1020,7 +1079,13 @@ function run(): Task
                         foreach ($mainTableSelectFields as $f) {
                             if (isset($f['expr'])) {
                                 $colName = $f['alias'] ?? $f['expr'];
-                                $row[$colName] = $artRow[$f['outputKey']] ?? null;
+                                if (!empty($f['joinRefs'])) {
+                                    // Value was fetched per-category; look it up in catExprData
+                                    $artId = (string)($artRow['id'] ?? '');
+                                    $row[$colName] = $catExprData[$idx][$artId][$f['outputKey']] ?? null;
+                                } else {
+                                    $row[$colName] = $artRow[$f['outputKey']] ?? null;
+                                }
                             } else {
                                 $colName = $f['alias'] ?? $f['column'];
                                 // main-table column keeps the bare name on conflict
