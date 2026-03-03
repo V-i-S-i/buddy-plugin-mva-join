@@ -390,12 +390,6 @@ function run(): Task
                     $rawExpr = trim($am[1]);
                     $alias = $am[2];
                 }
-                if (stripos($rawExpr, $joinTable . '.') !== false) {
-                    throw new RuntimeException(
-                        "MVA JOIN: aggregate functions on join-table columns are not supported (got: {$part}). "
-                        . 'Use a subquery or pre-aggregate the join table instead.'
-                    );
-                }
                 $sqlExpr = str_ireplace($mainTable . '.', '', $rawExpr);
                 // GROUP_CONCAT(DISTINCT col): Manticore does not support DISTINCT inside
                 // GROUP_CONCAT. Strip DISTINCT from the SQL and deduplicate in PHP.
@@ -408,18 +402,28 @@ function run(): Task
                 // by Manticore. Simulate in PHP: run a per-category SELECT of the inner expression
                 // and concatenate the results.
                 if (preg_match('/^GROUP_CONCAT\s*\(\s*(\w+\s*\(.*\))\s*\)$/is', $sqlExpr, $gcm)) {
-                    $innerExpr = str_ireplace($mainTable . '.', '', trim($gcm[1]));
+                    $rawInner   = trim($gcm[1]);
+                    $innerExpr  = str_ireplace($mainTable . '.', '', $rawInner);
+                    preg_match_all('/\b' . preg_quote($joinTable, '/') . '\.(\w+)\b/i', $rawInner, $jrm);
                     $mainTableAggExprs[] = [
                         'func'       => 'GC_PHP',
                         'column'     => '',
                         'outputName' => $alias ?? $part,
                         'innerExpr'  => $innerExpr,
+                        'joinRefs'   => $jrm[1],
                         'sqlExpr'    => '',
                         'sqlAlias'   => '_gcphp_' . count($mainTableAggExprs),
                         'dedup'      => $dedup,
                     ];
                     $selectOrder[] = ['type' => 'agg', 'idx' => count($mainTableAggExprs) - 1];
                     continue;
+                }
+                // Plain aggregates on join-table columns are not supported.
+                if (stripos($sqlExpr, $joinTable . '.') !== false) {
+                    throw new RuntimeException(
+                        "MVA JOIN: aggregate functions on join-table columns are not supported (got: {$part}). "
+                        . 'Use a subquery or pre-aggregate the join table instead.'
+                    );
                 }
                 $mainTableAggExprs[] = [
                     'func'      => 'PASSTHROUGH',
@@ -455,8 +459,8 @@ function run(): Task
             }
 
             // Arbitrary main-table function expression: SNIPPET(...), WEIGHT(), GEODIST(...), etc.
-            // Strip the main-table prefix from arguments, pass verbatim to the main-table query.
-            // join-table functions are not supported and are silently skipped.
+            // Strip the main-table prefix; join-table column refs (e.g. categories.name) are
+            // left in the expression and substituted with the actual per-category value at runtime.
             if (preg_match('/^\w+\s*\(/i', $part)) {
                 $alias = null;
                 $rawExpr = $part;
@@ -464,17 +468,17 @@ function run(): Task
                     $rawExpr = trim($am[1]);
                     $alias = $am[2];
                 }
-                if (stripos($rawExpr, $joinTable . '.') === false) {
-                    $sqlExpr = str_ireplace($mainTable . '.', '', $rawExpr);
-                    $outputKey = '_fexpr_' . count($mainTableSelectFields);
-                    $mainTableSelectFields[] = [
-                        'column'    => null,      // expression — not a plain column
-                        'expr'      => $sqlExpr,
-                        'alias'     => $alias,
-                        'outputKey' => $outputKey,
-                    ];
-                    $selectOrder[] = ['type' => 'raw', 'idx' => count($mainTableSelectFields) - 1];
-                }
+                $sqlExpr = str_ireplace($mainTable . '.', '', $rawExpr);
+                preg_match_all('/\b' . preg_quote($joinTable, '/') . '\.(\w+)\b/i', $rawExpr, $jrm);
+                $outputKey = '_fexpr_' . count($mainTableSelectFields);
+                $mainTableSelectFields[] = [
+                    'column'    => null,      // expression — not a plain column
+                    'expr'      => $sqlExpr,  // join-table refs left as-is; substituted per category
+                    'alias'     => $alias,
+                    'outputKey' => $outputKey,
+                    'joinRefs'  => $jrm[1],
+                ];
+                $selectOrder[] = ['type' => 'raw', 'idx' => count($mainTableSelectFields) - 1];
                 continue;
             }
 
@@ -619,6 +623,20 @@ function run(): Task
         $buildMvaInCond = static function (string $kwList) use ($mvaJoinConds): string {
             $parts = array_map(static fn($c) => "{$c['mvaField']} IN ({$kwList})", $mvaJoinConds);
             return count($parts) === 1 ? $parts[0] : '(' . implode(' AND ', $parts) . ')';
+        };
+
+        // Replace join-table column refs (e.g. categories.category_name) in an expression
+        // with the quoted value from the current category row.
+        $substituteJoinRefs = static function (string $expr, array $joinRefs, array $catRow) use ($joinTable): string {
+            foreach ($joinRefs as $col) {
+                $val  = addslashes((string)($catRow[$col] ?? ''));
+                $expr = preg_replace(
+                    '/\b' . preg_quote($joinTable, '/') . '\.' . preg_quote($col, '/') . '\b/i',
+                    "'{$val}'",
+                    $expr
+                );
+            }
+            return $expr;
         };
 
             $allKwList = implode(',', array_map($quoteKw, $allKeywords));
@@ -769,7 +787,10 @@ function run(): Task
                             }
                             // GC_PHP: run a full-result query per expression and concatenate in PHP
                             foreach ($gcPhpAggs as $agg) {
-                                $gcQuery = "SELECT {$agg['innerExpr']} AS _gc_val FROM {$mainTable} {$catWhereStr}";
+                                $resolvedInner = !empty($agg['joinRefs'])
+                                    ? $substituteJoinRefs($agg['innerExpr'], $agg['joinRefs'], $catRows[$idx])
+                                    : $agg['innerExpr'];
+                                $gcQuery = "SELECT {$resolvedInner} AS _gc_val FROM {$mainTable} {$catWhereStr}";
                                 file_put_contents($logFile, "  [Per-cat GC_PHP idx={$idx}]: " . substr($gcQuery, 0, 500) . "\n", FILE_APPEND);
                                 $gcResp = $manticoreClient->sendRequest($gcQuery);
                                 if ($gcResp->hasError()) {
@@ -790,7 +811,10 @@ function run(): Task
                             $rawParts = [];
                             foreach ($mainTableSelectFields as $f) {
                                 if (isset($f['expr'])) {
-                                    $rawParts[] = $f['expr'] . ' AS ' . $f['outputKey'];
+                                    $resolvedExpr = !empty($f['joinRefs'])
+                                        ? $substituteJoinRefs($f['expr'], $f['joinRefs'], $catRows[$idx])
+                                        : $f['expr'];
+                                    $rawParts[] = $resolvedExpr . ' AS ' . $f['outputKey'];
                                 } else {
                                     $rawParts[] = $f['column'] . ' AS _raw_' . $f['column'];
                                 }
