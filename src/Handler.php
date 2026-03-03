@@ -404,12 +404,22 @@ function run(): Task
                     $sqlExpr = preg_replace('/^(GROUP_CONCAT\s*\(\s*)DISTINCT\s+/i', '$1', $sqlExpr);
                     $dedup = true;
                 }
-                // Nested function calls inside GROUP_CONCAT are not supported by Manticore.
-                if (preg_match('/^GROUP_CONCAT\s*\(\s*\w+\s*\(/i', $sqlExpr)) {
-                    throw new RuntimeException(
-                        "MVA JOIN: GROUP_CONCAT with nested function calls is not supported by Manticore "
-                        . "(got: {$part}). Use GROUP_CONCAT(col) without inner functions."
-                    );
+                // Nested function calls inside GROUP_CONCAT (e.g. SNIPPET(...)) are not supported
+                // by Manticore. Simulate in PHP: run a per-category SELECT of the inner expression
+                // and concatenate the results.
+                if (preg_match('/^GROUP_CONCAT\s*\(\s*(\w+\s*\(.*\))\s*\)$/is', $sqlExpr, $gcm)) {
+                    $innerExpr = str_ireplace($mainTable . '.', '', trim($gcm[1]));
+                    $mainTableAggExprs[] = [
+                        'func'       => 'GC_PHP',
+                        'column'     => '',
+                        'outputName' => $alias ?? $part,
+                        'innerExpr'  => $innerExpr,
+                        'sqlExpr'    => '',
+                        'sqlAlias'   => '_gcphp_' . count($mainTableAggExprs),
+                        'dedup'      => $dedup,
+                    ];
+                    $selectOrder[] = ['type' => 'agg', 'idx' => count($mainTableAggExprs) - 1];
+                    continue;
                 }
                 $mainTableAggExprs[] = [
                     'func'      => 'PASSTHROUGH',
@@ -731,9 +741,13 @@ function run(): Task
 
                         // Aggregate functions (SUM, GROUP_CONCAT, AVG, etc.)
                         if (!empty($mainTableAggExprs)) {
-                            $aggParts = [];
+                            $aggParts  = [];
+                            $gcPhpAggs = [];
                             foreach ($mainTableAggExprs as $agg) {
-                                if ($agg['func'] === 'SUM_MVA_IN') {
+                                if ($agg['func'] === 'GC_PHP') {
+                                    // Handled separately below — collect all rows, concat in PHP
+                                    $gcPhpAggs[] = $agg;
+                                } elseif ($agg['func'] === 'SUM_MVA_IN') {
                                     // Dynamic: SUM(mvaField2 IN (cat_keywords)) per category
                                     $catKwList = implode(',', array_map($quoteKw, $catKeywords[$idx]));
                                     $aggParts[] = "SUM({$agg['column']} IN ({$catKwList})) AS {$agg['sqlAlias']}";
@@ -741,15 +755,33 @@ function run(): Task
                                     $aggParts[] = $agg['sqlExpr'] . ' AS ' . $agg['sqlAlias'];
                                 }
                             }
-                            $aggQuery = 'SELECT ' . implode(', ', $aggParts) . " FROM {$mainTable} {$catWhereStr}";
-                            file_put_contents($logFile, "  [Per-cat agg idx={$idx}]: " . substr($aggQuery, 0, 500) . "\n", FILE_APPEND);
-                            $aggResp = $manticoreClient->sendRequest($aggQuery);
-                            if ($aggResp->hasError()) {
-                                file_put_contents($logFile, "  [Per-cat agg ERR idx={$idx}]: " . $aggResp->getError() . "\n", FILE_APPEND);
-                                throw new RuntimeException('MVA JOIN per-category query failed: ' . $aggResp->getError());
-                            } else {
-                                $aggRespData = $aggResp->getData();
-                                $catRow = array_merge($catRow, $aggRespData[0] ?? []);
+                            if (!empty($aggParts)) {
+                                $aggQuery = 'SELECT ' . implode(', ', $aggParts) . " FROM {$mainTable} {$catWhereStr}";
+                                file_put_contents($logFile, "  [Per-cat agg idx={$idx}]: " . substr($aggQuery, 0, 500) . "\n", FILE_APPEND);
+                                $aggResp = $manticoreClient->sendRequest($aggQuery);
+                                if ($aggResp->hasError()) {
+                                    file_put_contents($logFile, "  [Per-cat agg ERR idx={$idx}]: " . $aggResp->getError() . "\n", FILE_APPEND);
+                                    throw new RuntimeException('MVA JOIN per-category query failed: ' . $aggResp->getError());
+                                } else {
+                                    $aggRespData = $aggResp->getData();
+                                    $catRow = array_merge($catRow, $aggRespData[0] ?? []);
+                                }
+                            }
+                            // GC_PHP: run a full-result query per expression and concatenate in PHP
+                            foreach ($gcPhpAggs as $agg) {
+                                $gcQuery = "SELECT {$agg['innerExpr']} AS _gc_val FROM {$mainTable} {$catWhereStr}";
+                                file_put_contents($logFile, "  [Per-cat GC_PHP idx={$idx}]: " . substr($gcQuery, 0, 500) . "\n", FILE_APPEND);
+                                $gcResp = $manticoreClient->sendRequest($gcQuery);
+                                if ($gcResp->hasError()) {
+                                    file_put_contents($logFile, "  [Per-cat GC_PHP ERR idx={$idx}]: " . $gcResp->getError() . "\n", FILE_APPEND);
+                                    $catRow[$agg['sqlAlias']] = null;
+                                } else {
+                                    $vals = array_column($gcResp->getData(), '_gc_val');
+                                    if (!empty($agg['dedup'])) {
+                                        $vals = array_values(array_unique($vals));
+                                    }
+                                    $catRow[$agg['sqlAlias']] = implode(',', $vals);
+                                }
                             }
                         }
 
@@ -829,7 +861,8 @@ function run(): Task
                                 case 'agg':
                                     $agg = $mainTableAggExprs[$spec['idx']];
                                     $val = $mainRow[$agg['sqlAlias']] ?? null;
-                                    if (!empty($agg['dedup']) && is_string($val) && $val !== '') {
+                                    // GC_PHP already deduped during collection; skip for other aggs
+                                    if ($agg['func'] !== 'GC_PHP' && !empty($agg['dedup']) && is_string($val) && $val !== '') {
                                         $val = implode(',', array_unique(array_map('trim', explode(',', $val))));
                                     }
                                     $row[$agg['outputName']] = $val;
