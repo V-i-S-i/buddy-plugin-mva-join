@@ -261,6 +261,12 @@ function run(): Task
         if (preg_match('/\bGROUP\s+BY\s+(.*?)(?=\s+(?:ORDER\s+BY|LIMIT|HAVING)\b|$)/is', $query, $m)) {
             $groupBy = trim($m[1]);
         }
+        // If GROUP BY references a main-table column (e.g. articles.feed_id), expand results
+        // to one row per (category, group-by value) instead of one row per category.
+        $mainGroupBy = null;
+        if ($groupBy && preg_match('/\b' . preg_quote($mainTable, '/') . '\.(\w+)\b/i', $groupBy, $gbm)) {
+            $mainGroupBy = $gbm[1];
+        }
 
         // ORDER BY
         $orderBy = '';
@@ -503,8 +509,9 @@ function run(): Task
         // Mode: aggregation when COUNT(*) or GROUP BY is present
         $isAggregation = $hasCountStar || $groupBy !== '';
 
-        // Per-category queries needed when SELECT references main-table fields/aggregates
-        $needPerCategoryQuery = !empty($mainTableAggExprs) || !empty($mainTableSelectFields);
+        // Per-category queries needed when SELECT references main-table fields/aggregates,
+        // or when GROUP BY references the main table (need per-group counts).
+        $needPerCategoryQuery = !empty($mainTableAggExprs) || !empty($mainTableSelectFields) || $mainGroupBy !== null;
 
         file_put_contents(
             $logFile,
@@ -758,7 +765,10 @@ function run(): Task
                         $catRow = [];
 
                         // Aggregate functions (SUM, GROUP_CONCAT, AVG, etc.)
-                        if (!empty($mainTableAggExprs)) {
+                        // When $mainGroupBy is set, the per-category query uses GROUP BY to produce
+                        // one row per (category, group-value) pair instead of a single aggregate row.
+                        $catGrpRows = [];  // populated when $mainGroupBy !== null
+                        if (!empty($mainTableAggExprs) || $mainGroupBy !== null) {
                             $aggParts  = [];
                             $gcPhpAggs = [];
                             foreach ($mainTableAggExprs as $agg) {
@@ -773,7 +783,22 @@ function run(): Task
                                     $aggParts[] = $agg['sqlExpr'] . ' AS ' . $agg['sqlAlias'];
                                 }
                             }
-                            if (!empty($aggParts)) {
+                            if ($mainGroupBy !== null) {
+                                // One row per group-by value; COUNT(*) per group replaces the global count
+                                $grpSelect = array_merge(
+                                    ["{$mainGroupBy} AS _grp_by", 'COUNT(*) AS _grp_cnt'],
+                                    $aggParts
+                                );
+                                $grpQuery = 'SELECT ' . implode(', ', $grpSelect)
+                                    . " FROM {$mainTable} {$catWhereStr} GROUP BY {$mainGroupBy}";
+                                file_put_contents($logFile, "  [Per-cat grp idx={$idx}]: " . substr($grpQuery, 0, 500) . "\n", FILE_APPEND);
+                                $grpResp = $manticoreClient->sendRequest($grpQuery);
+                                if ($grpResp->hasError()) {
+                                    file_put_contents($logFile, "  [Per-cat grp ERR idx={$idx}]: " . $grpResp->getError() . "\n", FILE_APPEND);
+                                    throw new RuntimeException('MVA JOIN per-category group query failed: ' . $grpResp->getError());
+                                }
+                                $catGrpRows = $grpResp->getData();
+                            } elseif (!empty($aggParts)) {
                                 $aggQuery = 'SELECT ' . implode(', ', $aggParts) . " FROM {$mainTable} {$catWhereStr}";
                                 file_put_contents($logFile, "  [Per-cat agg idx={$idx}]: " . substr($aggQuery, 0, 500) . "\n", FILE_APPEND);
                                 $aggResp = $manticoreClient->sendRequest($aggQuery);
@@ -781,32 +806,52 @@ function run(): Task
                                     file_put_contents($logFile, "  [Per-cat agg ERR idx={$idx}]: " . $aggResp->getError() . "\n", FILE_APPEND);
                                     throw new RuntimeException('MVA JOIN per-category query failed: ' . $aggResp->getError());
                                 } else {
-                                    $aggRespData = $aggResp->getData();
-                                    $catRow = array_merge($catRow, $aggRespData[0] ?? []);
+                                    $catRow = array_merge($catRow, $aggResp->getData()[0] ?? []);
                                 }
                             }
-                            // GC_PHP: run a full-result query per expression and concatenate in PHP
+                            // GC_PHP: run a full-result query per expression (and per group) then concat in PHP
                             foreach ($gcPhpAggs as $agg) {
                                 $resolvedInner = !empty($agg['joinRefs'])
                                     ? $substituteJoinRefs($agg['innerExpr'], $agg['joinRefs'], $catRows[$idx])
                                     : $agg['innerExpr'];
-                                $gcQuery = "SELECT {$resolvedInner} AS _gc_val FROM {$mainTable} {$catWhereStr}";
-                                file_put_contents($logFile, "  [Per-cat GC_PHP idx={$idx}]: " . substr($gcQuery, 0, 500) . "\n", FILE_APPEND);
-                                $gcResp = $manticoreClient->sendRequest($gcQuery);
-                                if ($gcResp->hasError()) {
-                                    file_put_contents($logFile, "  [Per-cat GC_PHP ERR idx={$idx}]: " . $gcResp->getError() . "\n", FILE_APPEND);
-                                    $catRow[$agg['sqlAlias']] = null;
-                                } else {
-                                    $vals = array_column($gcResp->getData(), '_gc_val');
-                                    if (!empty($agg['dedup'])) {
-                                        $vals = array_values(array_unique($vals));
+                                if ($mainGroupBy !== null) {
+                                    foreach ($catGrpRows as &$grpRow) {
+                                        $grpVal = $grpRow['_grp_by'];
+                                        $grpFilter = is_numeric($grpVal) ? "{$mainGroupBy} = {$grpVal}" : "{$mainGroupBy} = '" . addslashes((string)$grpVal) . "'";
+                                        $grpCatWhereStr = 'WHERE ' . implode(' AND ', array_merge($catWhereParts, [$grpFilter]));
+                                        $gcQuery = "SELECT {$resolvedInner} AS _gc_val FROM {$mainTable} {$grpCatWhereStr}";
+                                        file_put_contents($logFile, "  [Per-cat GC_PHP grp idx={$idx} grp={$grpVal}]: " . substr($gcQuery, 0, 500) . "\n", FILE_APPEND);
+                                        $gcResp = $manticoreClient->sendRequest($gcQuery);
+                                        if ($gcResp->hasError()) {
+                                            $grpRow[$agg['sqlAlias']] = null;
+                                        } else {
+                                            $vals = array_column($gcResp->getData(), '_gc_val');
+                                            if (!empty($agg['dedup'])) {
+                                                $vals = array_values(array_unique($vals));
+                                            }
+                                            $grpRow[$agg['sqlAlias']] = implode(',', $vals);
+                                        }
                                     }
-                                    $catRow[$agg['sqlAlias']] = implode(',', $vals);
+                                    unset($grpRow);
+                                } else {
+                                    $gcQuery = "SELECT {$resolvedInner} AS _gc_val FROM {$mainTable} {$catWhereStr}";
+                                    file_put_contents($logFile, "  [Per-cat GC_PHP idx={$idx}]: " . substr($gcQuery, 0, 500) . "\n", FILE_APPEND);
+                                    $gcResp = $manticoreClient->sendRequest($gcQuery);
+                                    if ($gcResp->hasError()) {
+                                        file_put_contents($logFile, "  [Per-cat GC_PHP ERR idx={$idx}]: " . $gcResp->getError() . "\n", FILE_APPEND);
+                                        $catRow[$agg['sqlAlias']] = null;
+                                    } else {
+                                        $vals = array_column($gcResp->getData(), '_gc_val');
+                                        if (!empty($agg['dedup'])) {
+                                            $vals = array_values(array_unique($vals));
+                                        }
+                                        $catRow[$agg['sqlAlias']] = implode(',', $vals);
+                                    }
                                 }
                             }
                         }
 
-                        // Raw (non-aggregate) main-table fields - pick any matching row
+                        // Raw (non-aggregate) main-table fields — pick any matching row (per group when grouped)
                         if (!empty($mainTableSelectFields)) {
                             $rawParts = [];
                             foreach ($mainTableSelectFields as $f) {
@@ -819,96 +864,141 @@ function run(): Task
                                     $rawParts[] = $f['column'] . ' AS _raw_' . $f['column'];
                                 }
                             }
-                            $rawQuery = 'SELECT ' . implode(', ', $rawParts) . " FROM {$mainTable} {$catWhereStr} LIMIT 1";
-                            file_put_contents($logFile, "  [Per-cat raw idx={$idx}]: " . substr($rawQuery, 0, 500) . "\n", FILE_APPEND);
-                            $rawResp = $manticoreClient->sendRequest($rawQuery);
-                            if ($rawResp->hasError()) {
-                                file_put_contents($logFile, "  [Per-cat raw ERR idx={$idx}]: " . $rawResp->getError() . "\n", FILE_APPEND);
-                                throw new RuntimeException('MVA JOIN per-category query failed: ' . $rawResp->getError());
+                            if ($mainGroupBy !== null) {
+                                foreach ($catGrpRows as &$grpRow) {
+                                    $grpVal = $grpRow['_grp_by'];
+                                    $grpFilter = is_numeric($grpVal) ? "{$mainGroupBy} = {$grpVal}" : "{$mainGroupBy} = '" . addslashes((string)$grpVal) . "'";
+                                    $grpCatWhereStr = 'WHERE ' . implode(' AND ', array_merge($catWhereParts, [$grpFilter]));
+                                    $rawQuery = 'SELECT ' . implode(', ', $rawParts) . " FROM {$mainTable} {$grpCatWhereStr} LIMIT 1";
+                                    file_put_contents($logFile, "  [Per-cat raw grp idx={$idx} grp={$grpVal}]: " . substr($rawQuery, 0, 500) . "\n", FILE_APPEND);
+                                    $rawResp = $manticoreClient->sendRequest($rawQuery);
+                                    if ($rawResp->hasError()) {
+                                        file_put_contents($logFile, "  [Per-cat raw grp ERR idx={$idx} grp={$grpVal}]: " . $rawResp->getError() . "\n", FILE_APPEND);
+                                    } else {
+                                        $grpRow = array_merge($grpRow, $rawResp->getData()[0] ?? []);
+                                    }
+                                }
+                                unset($grpRow);
                             } else {
-                                $rawRespData = $rawResp->getData();
-                                $catRow = array_merge($catRow, $rawRespData[0] ?? []);
+                                $rawQuery = 'SELECT ' . implode(', ', $rawParts) . " FROM {$mainTable} {$catWhereStr} LIMIT 1";
+                                file_put_contents($logFile, "  [Per-cat raw idx={$idx}]: " . substr($rawQuery, 0, 500) . "\n", FILE_APPEND);
+                                $rawResp = $manticoreClient->sendRequest($rawQuery);
+                                if ($rawResp->hasError()) {
+                                    file_put_contents($logFile, "  [Per-cat raw ERR idx={$idx}]: " . $rawResp->getError() . "\n", FILE_APPEND);
+                                    throw new RuntimeException('MVA JOIN per-category query failed: ' . $rawResp->getError());
+                                } else {
+                                    $catRow = array_merge($catRow, $rawResp->getData()[0] ?? []);
+                                }
                             }
                         }
 
                         // SELECT * - fetch all main-table columns; silently skip unsupported-type errors
                         if ($selectStar) {
-                            $starQuery = "SELECT * FROM {$mainTable} {$catWhereStr} LIMIT 1";
-                            file_put_contents($logFile, "  [Per-cat star idx={$idx}]: " . substr($starQuery, 0, 500) . "\n", FILE_APPEND);
-                            $starResp = $manticoreClient->sendRequest($starQuery);
-                            if (!$starResp->hasError()) {
-                                $catRow = array_merge($catRow, $starResp->getData()[0] ?? []);
+                            if ($mainGroupBy !== null) {
+                                foreach ($catGrpRows as &$grpRow) {
+                                    $grpVal = $grpRow['_grp_by'];
+                                    $grpFilter = is_numeric($grpVal) ? "{$mainGroupBy} = {$grpVal}" : "{$mainGroupBy} = '" . addslashes((string)$grpVal) . "'";
+                                    $grpCatWhereStr = 'WHERE ' . implode(' AND ', array_merge($catWhereParts, [$grpFilter]));
+                                    $starQuery = "SELECT * FROM {$mainTable} {$grpCatWhereStr} LIMIT 1";
+                                    file_put_contents($logFile, "  [Per-cat star grp idx={$idx} grp={$grpVal}]: " . substr($starQuery, 0, 500) . "\n", FILE_APPEND);
+                                    $starResp = $manticoreClient->sendRequest($starQuery);
+                                    if (!$starResp->hasError()) {
+                                        $grpRow = array_merge($grpRow, $starResp->getData()[0] ?? []);
+                                    } else {
+                                        file_put_contents($logFile, "  [Per-cat star grp ERR idx={$idx} grp={$grpVal}]: " . $starResp->getError() . "\n", FILE_APPEND);
+                                    }
+                                }
+                                unset($grpRow);
                             } else {
-                                file_put_contents($logFile, "  [Per-cat star ERR idx={$idx}]: " . $starResp->getError() . "\n", FILE_APPEND);
+                                $starQuery = "SELECT * FROM {$mainTable} {$catWhereStr} LIMIT 1";
+                                file_put_contents($logFile, "  [Per-cat star idx={$idx}]: " . substr($starQuery, 0, 500) . "\n", FILE_APPEND);
+                                $starResp = $manticoreClient->sendRequest($starQuery);
+                                if (!$starResp->hasError()) {
+                                    $catRow = array_merge($catRow, $starResp->getData()[0] ?? []);
+                                } else {
+                                    file_put_contents($logFile, "  [Per-cat star ERR idx={$idx}]: " . $starResp->getError() . "\n", FILE_APPEND);
+                                }
                             }
                         }
 
-                        $catMainData[$idx] = $catRow;
-                        file_put_contents($logFile, "  [Per-cat result idx={$idx}]: " . json_encode($catRow) . "\n", FILE_APPEND);
+                        $catMainData[$idx] = $mainGroupBy !== null ? $catGrpRows : $catRow;
+                        file_put_contents($logFile, "  [Per-cat result idx={$idx}]: " . json_encode($catMainData[$idx]) . "\n", FILE_APPEND);
                     }
                 }
 
-                // Build result rows
+                // Build result rows.
+                // When $mainGroupBy is set, each category emits one row per group-by value
+                // (e.g. one row per feed_id). When not set, one row per category.
                 $resultRows = [];
+                $mvaFieldNames = array_column($mvaJoinConds, 'mvaField');
+                $internalGrpKeys = ['_grp_by', '_grp_cnt'];
                 foreach ($matchedIdxMap as $idx => $count) {
                     $catRow = $catRows[$idx];
-                    $mainRow = $needPerCategoryQuery ? ($catMainData[$idx] ?? []) : [];
-                    $row = [];
-                    $mvaFieldNames = array_column($mvaJoinConds, 'mvaField');
-                    if ($selectStar) {
-                        // Main-table columns first (they keep the bare name on conflict)
-                        foreach ($mainRow as $col => $val) {
-                            if (!in_array($col, $mvaFieldNames, true)) {
-                                $row[$col] = $val;
+                    $catData = $needPerCategoryQuery ? ($catMainData[$idx] ?? []) : [];
+                    // With $mainGroupBy: $catData is an array of group rows; without: a single assoc array
+                    $grpRowsToEmit = ($mainGroupBy !== null && is_array($catData) && isset($catData[0]))
+                        ? $catData
+                        : [null];
+                    foreach ($grpRowsToEmit as $grpMainRow) {
+                        $mainRow = $grpMainRow ?? $catData;
+                        $actualCount = $mainGroupBy !== null ? (int)($grpMainRow['_grp_cnt'] ?? 0) : $count;
+                        $row = [];
+                        if ($selectStar) {
+                            // Main-table columns first (they keep the bare name on conflict);
+                            // skip internal grouping keys
+                            foreach ($mainRow as $col => $val) {
+                                if (!in_array($col, $mvaFieldNames, true) && !in_array($col, $internalGrpKeys, true)) {
+                                    $row[$col] = $val;
+                                }
                             }
-                        }
-                        $row[$countStarAlias] = $count;
-                        // Join-table columns: qualify name if it collides with a main-table column
-                        foreach ($catRow as $col => $val) {
-                            $colName = isset($row[$col]) ? $joinTable . '.' . $col : $col;
-                            $row[$colName] = $val;
-                        }
-                    } else {
-                        foreach ($selectOrder as $spec) {
-                            switch ($spec['type']) {
-                                case 'count':
-                                    $row[$countStarAlias] = $count;
-                                    break;
-                                case 'join':
-                                    $f = $joinTableSelectFields[$spec['idx']];
-                                    $colName = $f['alias'] ?? $f['column'];
-                                    if ($f['alias'] === null && isset($colConflicts[$colName])) {
-                                        $colName = $joinTable . '.' . $f['column'];
-                                    }
-                                    $row[$colName] = $catRow[$f['column']] ?? null;
-                                    break;
-                                case 'agg':
-                                    $agg = $mainTableAggExprs[$spec['idx']];
-                                    $val = $mainRow[$agg['sqlAlias']] ?? null;
-                                    // GC_PHP already deduped during collection; skip for other aggs
-                                    if ($agg['func'] !== 'GC_PHP' && !empty($agg['dedup']) && is_string($val) && $val !== '') {
-                                        $val = implode(',', array_unique(array_map('trim', explode(',', $val))));
-                                    }
-                                    $row[$agg['outputName']] = $val;
-                                    break;
-                                case 'raw':
-                                    $f = $mainTableSelectFields[$spec['idx']];
-                                    if (isset($f['expr'])) {
-                                        $colName = $f['alias'] ?? $f['expr'];
-                                        $row[$colName] = $mainRow[$f['outputKey']] ?? null;
-                                    } else {
+                            $row[$countStarAlias] = $actualCount;
+                            // Join-table columns: qualify name if it collides with a main-table column
+                            foreach ($catRow as $col => $val) {
+                                $colName = isset($row[$col]) ? $joinTable . '.' . $col : $col;
+                                $row[$colName] = $val;
+                            }
+                        } else {
+                            foreach ($selectOrder as $spec) {
+                                switch ($spec['type']) {
+                                    case 'count':
+                                        $row[$countStarAlias] = $actualCount;
+                                        break;
+                                    case 'join':
+                                        $f = $joinTableSelectFields[$spec['idx']];
                                         $colName = $f['alias'] ?? $f['column'];
-                                        // main-table column keeps the bare name on conflict
-                                        $row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
-                                    }
-                                    break;
-                                case 'literal':
-                                    $row[$spec['outputName']] = $spec['value'];
-                                    break;
+                                        if ($f['alias'] === null && isset($colConflicts[$colName])) {
+                                            $colName = $joinTable . '.' . $f['column'];
+                                        }
+                                        $row[$colName] = $catRow[$f['column']] ?? null;
+                                        break;
+                                    case 'agg':
+                                        $agg = $mainTableAggExprs[$spec['idx']];
+                                        $val = $mainRow[$agg['sqlAlias']] ?? null;
+                                        // GC_PHP already deduped during collection; skip for other aggs
+                                        if ($agg['func'] !== 'GC_PHP' && !empty($agg['dedup']) && is_string($val) && $val !== '') {
+                                            $val = implode(',', array_unique(array_map('trim', explode(',', $val))));
+                                        }
+                                        $row[$agg['outputName']] = $val;
+                                        break;
+                                    case 'raw':
+                                        $f = $mainTableSelectFields[$spec['idx']];
+                                        if (isset($f['expr'])) {
+                                            $colName = $f['alias'] ?? $f['expr'];
+                                            $row[$colName] = $mainRow[$f['outputKey']] ?? null;
+                                        } else {
+                                            $colName = $f['alias'] ?? $f['column'];
+                                            // main-table column keeps the bare name on conflict
+                                            $row[$colName] = $mainRow['_raw_' . $f['column']] ?? null;
+                                        }
+                                        break;
+                                    case 'literal':
+                                        $row[$spec['outputName']] = $spec['value'];
+                                        break;
+                                }
                             }
                         }
+                        $resultRows[] = $row;
                     }
-                    $resultRows[] = $row;
                 }
 
                 file_put_contents($logFile, '  Result rows built: ' . count($resultRows) . "\n", FILE_APPEND);
