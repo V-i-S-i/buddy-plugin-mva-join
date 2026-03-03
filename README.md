@@ -36,7 +36,9 @@ The `ON` clause must link the MVA field(s) on the main table to the correspondin
 | `COUNT(*)` | `COUNT(*) AS cnt` | Counts matching main-table rows per join-table row |
 | Aggregate functions | `SUM(articles.auditorium)` | `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT` — passed verbatim to Manticore after stripping the table prefix |
 | `GROUP_CONCAT(DISTINCT col)` | `GROUP_CONCAT(DISTINCT articles.feed_id) AS feeds` | `DISTINCT` is stripped before sending to Manticore; deduplication is done in PHP |
+| `GROUP_CONCAT(FUNC(...))` | `GROUP_CONCAT(SNIPPET(articles.content, QUERY(), 'around=40')) AS snips` | Nested function calls unsupported by Manticore are simulated in PHP: the inner expression is fetched per-category and the results are concatenated |
 | MVA cross-field count | `SUM(articles.neutral_kw_id IN (categories.keyword_id))` | Counts articles where a second MVA field contains the current category's keyword |
+| Arbitrary function | `SNIPPET(articles.content, QUERY()) AS snip` | Any function expression — `SNIPPET`, `WEIGHT()`, `GEODIST()`, etc. — is passed verbatim to the main-table query after stripping the table prefix |
 | String literal | `'label' AS col` | Fixed value repeated in every result row |
 
 Column order in the result set matches the order in the SELECT list.
@@ -75,7 +77,8 @@ SELECT categories.category_name, categories.id,
        SUM(articles_today_lt.neutral_keyword_id  IN (categories.keyword_id)) AS cnt_neutral,
        SUM(articles_today_lt.positive_keyword_id IN (categories.keyword_id)) AS cnt_positive,
        GROUP_CONCAT(articles_today_lt.id) AS article_ids,
-       GROUP_CONCAT(DISTINCT articles_today_lt.feed_id) AS distinct_feeds
+       GROUP_CONCAT(DISTINCT articles_today_lt.feed_id) AS distinct_feeds,
+       GROUP_CONCAT(SNIPPET(articles_today_lt.content, QUERY(), 'around=40', 'limit=200')) AS snippets
 FROM articles_today_lt
 MVA JOIN categories
     ON articles_today_lt.keyword_id = categories.keyword_id
@@ -133,7 +136,7 @@ The plugin implements **INNER JOIN** semantics: join-table rows with zero matchi
 - Unqualified column names (without a `table.` prefix) in the SELECT list are ignored, as they are ambiguous.
 - `OR` conditions that reference columns from both tables in a single clause cannot be automatically routed and are silently dropped.
 - Aggregates on join-table columns (e.g. `SUM(categories.weight)`) are not supported — an error is returned.
-- `GROUP_CONCAT` with nested function calls (e.g. `GROUP_CONCAT(TOSTRING(col))`) is not supported by Manticore — an error is returned. Use `GROUP_CONCAT(col)` instead.
+- `GROUP_CONCAT` with nested function calls (e.g. `GROUP_CONCAT(SNIPPET(...))`) is simulated in PHP (Mode A only). One extra query per matched category is issued to collect the inner expression's values, which may be slow for large result sets.
 - Multi-condition ON clause: all ON conditions must reference the **same join-table field** (`joinField`). Conditions with different join-table fields are not currently supported.
 - **`HAVING` is not supported.** A `HAVING` clause is silently ignored and will produce incorrect results. *(TODO: detect and raise an error)*
 - **Large join tables and aggregation query size.** In Mode A, one `SUM(mvaField IN (...))` expression is generated per matched join-table row. With hundreds of rows and many keywords, the resulting SQL string can grow very large. A pre-filter step reduces this in practice, but pathological cases may still hit Manticore's query-length limit. *(TODO: chunk into batches of N rows)*
