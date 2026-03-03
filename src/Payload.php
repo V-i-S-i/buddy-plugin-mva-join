@@ -31,34 +31,77 @@ final class Payload extends BasePayload
 		return 'Simulates MVA JOIN by executing the join table query separately and aggregating/expanding results in PHP';
 	}
 
+	/** Cached result of debug-mode detection. */
+	private static ?bool $debugEnabled = null;
+
+	/**
+	 * Returns true when Buddy was started with --log-level=debug[v[v]].
+	 * Reads /proc/self/cmdline once and caches the result.
+	 */
+	private static function isDebugEnabled(): bool
+	{
+		if (self::$debugEnabled === null) {
+			$cmdline = @file_get_contents('/proc/self/cmdline');
+			if ($cmdline !== false) {
+				// Arguments are separated by null bytes in /proc/self/cmdline
+				$args = explode("\0", $cmdline);
+				self::$debugEnabled = in_array('--log-level=debugvv', $args, true)
+					|| in_array('--log-level=debugv', $args, true)
+					|| in_array('--log-level=debug', $args, true);
+			} else {
+				self::$debugEnabled = false;
+			}
+		}
+		return self::$debugEnabled;
+	}
+
 	/**
 	 * Fast detection: SELECT query containing "MVA JOIN".
 	 */
 	public static function hasMatch(Request $request): bool
 	{
-		$logFile = '/tmp/mva-join-debug.log';
-
 		try {
 			$query = self::getQuery($request);
 
-			$debugInfo = sprintf(
-				"[%s] hasMatch() called!\n  payload: %s\n",
-				date('Y-m-d H:i:s'),
-				substr($query, 0, 200)
-			);
-			file_put_contents($logFile, $debugInfo, FILE_APPEND);
+			if (self::isDebugEnabled()) {
+				$logFile = '/tmp/mva-join-debug.log';
+				file_put_contents(
+					$logFile,
+					sprintf(
+						"[%s] hasMatch() called!\n  payload: %s\n",
+						date('Y-m-d H:i:s'),
+						substr($query, 0, 200)
+					),
+					FILE_APPEND
+				);
+			}
 
 			if (!preg_match('/^\s*SELECT\s+/i', $query)) {
-				file_put_contents($logFile, "  Not a SELECT query\n\n", FILE_APPEND);
+				if (self::isDebugEnabled()) {
+					file_put_contents('/tmp/mva-join-debug.log', "  Not a SELECT query\n\n", FILE_APPEND);
+				}
 				return false;
 			}
 
 			$hasMatch = preg_match('/\bMVA\s+JOIN\b/i', $query) > 0;
-			file_put_contents($logFile, '  Has MVA JOIN: ' . ($hasMatch ? 'YES' : 'NO') . "\n\n", FILE_APPEND);
+
+			if (self::isDebugEnabled()) {
+				file_put_contents(
+					'/tmp/mva-join-debug.log',
+					'  Has MVA JOIN: ' . ($hasMatch ? 'YES' : 'NO') . "\n\n",
+					FILE_APPEND
+				);
+			}
 
 			return $hasMatch;
 		} catch (\Throwable $e) {
-			file_put_contents($logFile, '  ERROR in hasMatch: ' . $e->getMessage() . "\n\n", FILE_APPEND);
+			if (self::isDebugEnabled()) {
+				file_put_contents(
+					'/tmp/mva-join-debug.log',
+					'  ERROR in hasMatch: ' . $e->getMessage() . "\n\n",
+					FILE_APPEND
+				);
+			}
 			return false;
 		}
 	}
