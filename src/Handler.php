@@ -685,6 +685,61 @@ function run(): Task
             // ==================================================================
     
             if ($isAggregation) {
+                // ---- GLOBAL AGGREGATION SHORTCUT ----------------------------------------
+                // When GROUP BY references a main-table column and the SELECT list contains
+                // no join-table columns or join-table-dependent expressions, we can skip
+                // all per-category logic and run one query against the main table directly,
+                // filtered by the full set of customer keywords.  This avoids the
+                // (category × feed_id) cartesian explosion and double-counting.
+                // -------------------------------------------------------------------------
+                $noJoinCols = empty($joinTableSelectFields) && !$selectStar;
+                $noJoinAggExprs = empty(array_filter(
+                    $mainTableAggExprs,
+                    static fn($a) => $a['func'] === 'SUM_MVA_IN'
+                        || !empty($a['joinRefs'])
+                        || !empty($a['dedup'])
+                ));
+
+                if ($mainGroupBy !== null && $noJoinCols && $noJoinAggExprs) {
+                    $gaParts = [];
+                    foreach ($selectOrder as $so) {
+                        if ($so['type'] === 'count') {
+                            $gaParts[] = "COUNT(*) AS {$countStarAlias}";
+                        } elseif ($so['type'] === 'agg') {
+                            $agg = $mainTableAggExprs[$so['idx']];
+                            $gaParts[] = $agg['sqlExpr'] . ' AS ' . $agg['outputName'];
+                        } elseif ($so['type'] === 'raw') {
+                            $f = $mainTableSelectFields[$so['idx']];
+                            $col = $f['column'];
+                            $out = $f['alias'] ?? $f['outputKey'] ?? $col;
+                            $gaParts[] = $col === $out ? $col : "{$col} AS {$out}";
+                        } elseif ($so['type'] === 'literal') {
+                            $gaParts[] = "'{$so['value']}' AS {$so['key']}";
+                        }
+                    }
+                    $gaOrderBy = $orderBy !== ''
+                        ? ' ORDER BY ' . str_ireplace($mainTable . '.', '', $orderBy)
+                        : '';
+                    $gaLimit = $limitCount > 0 ? " LIMIT {$limitOffset}, {$limitCount}" : '';
+                    $gaQuery = 'SELECT ' . implode(', ', $gaParts)
+                        . " FROM {$mainTable} {$mainWhereStr} GROUP BY {$mainGroupBy}"
+                        . $gaOrderBy . $gaLimit;
+                    file_put_contents($logFile, "\n  [Global Agg Query]: {$gaQuery}\n", FILE_APPEND);
+                    $gaResp = $timedRequest($gaQuery);
+                    if ($gaResp->hasError()) {
+                        throw new RuntimeException('MVA JOIN: global aggregation query failed: ' . $gaResp->getError());
+                    }
+                    $resultRows = $gaResp->getData();
+                    file_put_contents($logFile, '  Returning ' . count($resultRows) . ' rows (global agg mode) | total ' . sprintf('%.1f', (microtime(true) - $startTime) * 1000) . "ms\n\n", FILE_APPEND);
+                    $result = TaskResult::withData($resultRows);
+                    foreach (array_keys($resultRows[0] ?? []) as $colName) {
+                        $val = $resultRows[0][$colName] ?? null;
+                        $result->column($colName, is_int($val) ? Column::Long : Column::String);
+                    }
+                    return $result;
+                }
+                // ---- END GLOBAL AGGREGATION SHORTCUT ------------------------------------
+
                 // Pre-filter optimisation: find only the keyword values that actually
                 // exist in the filtered main table before building SUM expressions.
                 // This can collapse hundreds of SUM expressions down to a handful when
