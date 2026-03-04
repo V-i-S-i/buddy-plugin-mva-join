@@ -154,10 +154,9 @@ The plugin implements **INNER JOIN** semantics: join-table rows with zero matchi
 
 ## Limitations
 
-- Join-table fetch is capped at **10,000 rows**. A warning is emitted via `trigger_error` when the cap is hit.
-- Main-table fetch (Mode B) is capped at **50,000 rows**. A warning is emitted when the cap is hit.
+- Join-table fetch is capped at **10,000 rows**. A warning is written to the log when the cap is hit.
+- Main-table fetch (Mode B) is capped at **50,000 rows**. Without `ORDER BY`, exactly `LIMIT` rows are fetched (every keyword-filtered article is guaranteed to match at least one category). With `ORDER BY`, `LIMIT × 100` rows are fetched (capped at 50,000) so PHP-side sorting has enough data. A warning is written to the log when the cap is hit.
 - When no `LIMIT` is specified, Manticore returns at most **20 rows** by default. Add an explicit `LIMIT` to get more results.
-- The `LIMIT` multiplier heuristic (`LIMIT n` → fetch `n × 100` main-table rows) may be insufficient when one main-table row expands into many join-table matches. If results appear truncated, increase the LIMIT or rely on the 50,000-row cap.
 - Unqualified column names (without a `table.` prefix) in the SELECT list are ignored, as they are ambiguous.
 - `OR` conditions that reference columns from both tables in a single clause cannot be automatically routed and are silently dropped.
 - Aggregates on join-table columns (e.g. `SUM(categories.weight)`) are not supported — an error is returned.
@@ -185,4 +184,4 @@ CREATE PLUGIN visi/buddy-plugin-mva-join TYPE 'buddy' VERSION 'dev-main'
 The plugin writes diagnostic logs to:
 
 - `/tmp/mva-join-debug.log` — query detection (`hasMatch`)
-- `/tmp/mva-join-handler.log` — full execution trace including all sub-queries and row counts
+- `/tmp/mva-join-handler.log` — full execution trace including all sub-queries with per-query execution time (`→ Xms`) and total request time
