@@ -712,7 +712,15 @@ function run(): Task
                             $f = $mainTableSelectFields[$so['idx']];
                             $col = $f['column'];
                             $out = $f['alias'] ?? $f['outputKey'] ?? $col;
-                            $gaParts[] = $col === $out ? $col : "{$col} AS {$out}";
+                            if ($col === $mainGroupBy) {
+                                // GROUPBY() returns the individual expanded value used as
+                                // the group key — correct for both regular and MVA fields.
+                                // Selecting the column directly would return the full
+                                // comma-separated MVA string, causing apparent duplicates.
+                                $gaParts[] = "GROUPBY() AS {$out}";
+                            } else {
+                                $gaParts[] = $col === $out ? $col : "{$col} AS {$out}";
+                            }
                         } elseif ($so['type'] === 'literal') {
                             $gaParts[] = "'{$so['value']}' AS {$so['key']}";
                         }
