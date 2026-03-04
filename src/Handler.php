@@ -50,6 +50,7 @@ function run(): Task
     ): TaskResult {
 
         $logFile = '/tmp/mva-join-handler.log';
+        $startTime = microtime(true);
         file_put_contents($logFile, "\n[" . date('Y-m-d H:i:s') . "] Handler started\n", FILE_APPEND);
 
         $query = $payload->query;
@@ -186,6 +187,20 @@ function run(): Task
                 return 0;
             });
             return $rows;
+        };
+
+        /**
+         * Execute a Manticore query and log its duration.
+         */
+        $timedRequest = static function (string $sql) use ($manticoreClient, $logFile): object {
+            $t0 = microtime(true);
+            $resp = $manticoreClient->sendRequest($sql);
+            file_put_contents(
+                $logFile,
+                sprintf("  → %.1fms\n", (microtime(true) - $t0) * 1000),
+                FILE_APPEND
+            );
+            return $resp;
         };
 
         // ==================================================================
@@ -567,11 +582,11 @@ function run(): Task
         $joinWhereStr = !empty($joinTableConditions)
             ? 'WHERE ' . implode(' AND ', $joinTableConditions)
             : '';
-        $joinQuery = "SELECT {$joinSelectStr} FROM {$joinTable} {$joinWhereStr} LIMIT 0, 10000";
+        $joinQuery = "SELECT {$joinSelectStr} FROM {$joinTable} {$joinWhereStr} LIMIT 0, 10000 OPTION max_matches = 10000";
 
         file_put_contents($logFile, "\n  [Join Table Query]: {$joinQuery}\n", FILE_APPEND);
 
-        $joinResponse = $manticoreClient->sendRequest($joinQuery);
+        $joinResponse = $timedRequest($joinQuery);
         if ($joinResponse->hasError()) {
             throw new RuntimeException('MVA JOIN: join table query failed: ' . $joinResponse->getError());
         }
@@ -682,7 +697,7 @@ function run(): Task
                         . implode(' AND ', $preFilterWhereParts)
                         . " GROUP BY {$mvaField}";
                     file_put_contents($logFile, "\n  [Pre-filter Query]: {$preFilterQuery}\n", FILE_APPEND);
-                    $preFilterResp = $manticoreClient->sendRequest($preFilterQuery);
+                    $preFilterResp = $timedRequest($preFilterQuery);
                     if (!$preFilterResp->hasError()) {
                         $activeKwMap = [];
                         foreach ($preFilterResp->getData() as $pfRow) {
@@ -731,7 +746,7 @@ function run(): Task
 
                 file_put_contents($logFile, "\n  [Aggregation Query]: " . substr($aggQuery, 0, 1000) . "\n", FILE_APPEND);
 
-                $aggResponse = $manticoreClient->sendRequest($aggQuery);
+                $aggResponse = $timedRequest($aggQuery);
                 if ($aggResponse->hasError()) {
                     throw new RuntimeException('MVA JOIN: aggregation query failed: ' . $aggResponse->getError());
                 }
@@ -792,7 +807,7 @@ function run(): Task
                                 $grpQuery = 'SELECT ' . implode(', ', $grpSelect)
                                     . " FROM {$mainTable} {$catWhereStr} GROUP BY {$mainGroupBy}";
                                 file_put_contents($logFile, "  [Per-cat grp idx={$idx}]: " . substr($grpQuery, 0, 500) . "\n", FILE_APPEND);
-                                $grpResp = $manticoreClient->sendRequest($grpQuery);
+                                $grpResp = $timedRequest($grpQuery);
                                 if ($grpResp->hasError()) {
                                     file_put_contents($logFile, "  [Per-cat grp ERR idx={$idx}]: " . $grpResp->getError() . "\n", FILE_APPEND);
                                     throw new RuntimeException('MVA JOIN per-category group query failed: ' . $grpResp->getError());
@@ -801,7 +816,7 @@ function run(): Task
                             } elseif (!empty($aggParts)) {
                                 $aggQuery = 'SELECT ' . implode(', ', $aggParts) . " FROM {$mainTable} {$catWhereStr}";
                                 file_put_contents($logFile, "  [Per-cat agg idx={$idx}]: " . substr($aggQuery, 0, 500) . "\n", FILE_APPEND);
-                                $aggResp = $manticoreClient->sendRequest($aggQuery);
+                                $aggResp = $timedRequest($aggQuery);
                                 if ($aggResp->hasError()) {
                                     file_put_contents($logFile, "  [Per-cat agg ERR idx={$idx}]: " . $aggResp->getError() . "\n", FILE_APPEND);
                                     throw new RuntimeException('MVA JOIN per-category query failed: ' . $aggResp->getError());
@@ -821,7 +836,7 @@ function run(): Task
                                         $grpCatWhereStr = 'WHERE ' . implode(' AND ', array_merge($catWhereParts, [$grpFilter]));
                                         $gcQuery = "SELECT {$resolvedInner} AS _gc_val FROM {$mainTable} {$grpCatWhereStr}";
                                         file_put_contents($logFile, "  [Per-cat GC_PHP grp idx={$idx} grp={$grpVal}]: " . substr($gcQuery, 0, 500) . "\n", FILE_APPEND);
-                                        $gcResp = $manticoreClient->sendRequest($gcQuery);
+                                        $gcResp = $timedRequest($gcQuery);
                                         if ($gcResp->hasError()) {
                                             $grpRow[$agg['sqlAlias']] = null;
                                         } else {
@@ -836,7 +851,7 @@ function run(): Task
                                 } else {
                                     $gcQuery = "SELECT {$resolvedInner} AS _gc_val FROM {$mainTable} {$catWhereStr}";
                                     file_put_contents($logFile, "  [Per-cat GC_PHP idx={$idx}]: " . substr($gcQuery, 0, 500) . "\n", FILE_APPEND);
-                                    $gcResp = $manticoreClient->sendRequest($gcQuery);
+                                    $gcResp = $timedRequest($gcQuery);
                                     if ($gcResp->hasError()) {
                                         file_put_contents($logFile, "  [Per-cat GC_PHP ERR idx={$idx}]: " . $gcResp->getError() . "\n", FILE_APPEND);
                                         $catRow[$agg['sqlAlias']] = null;
@@ -871,7 +886,7 @@ function run(): Task
                                     $grpCatWhereStr = 'WHERE ' . implode(' AND ', array_merge($catWhereParts, [$grpFilter]));
                                     $rawQuery = 'SELECT ' . implode(', ', $rawParts) . " FROM {$mainTable} {$grpCatWhereStr} LIMIT 1";
                                     file_put_contents($logFile, "  [Per-cat raw grp idx={$idx} grp={$grpVal}]: " . substr($rawQuery, 0, 500) . "\n", FILE_APPEND);
-                                    $rawResp = $manticoreClient->sendRequest($rawQuery);
+                                    $rawResp = $timedRequest($rawQuery);
                                     if ($rawResp->hasError()) {
                                         file_put_contents($logFile, "  [Per-cat raw grp ERR idx={$idx} grp={$grpVal}]: " . $rawResp->getError() . "\n", FILE_APPEND);
                                     } else {
@@ -882,7 +897,7 @@ function run(): Task
                             } else {
                                 $rawQuery = 'SELECT ' . implode(', ', $rawParts) . " FROM {$mainTable} {$catWhereStr} LIMIT 1";
                                 file_put_contents($logFile, "  [Per-cat raw idx={$idx}]: " . substr($rawQuery, 0, 500) . "\n", FILE_APPEND);
-                                $rawResp = $manticoreClient->sendRequest($rawQuery);
+                                $rawResp = $timedRequest($rawQuery);
                                 if ($rawResp->hasError()) {
                                     file_put_contents($logFile, "  [Per-cat raw ERR idx={$idx}]: " . $rawResp->getError() . "\n", FILE_APPEND);
                                     throw new RuntimeException('MVA JOIN per-category query failed: ' . $rawResp->getError());
@@ -901,7 +916,7 @@ function run(): Task
                                     $grpCatWhereStr = 'WHERE ' . implode(' AND ', array_merge($catWhereParts, [$grpFilter]));
                                     $starQuery = "SELECT * FROM {$mainTable} {$grpCatWhereStr} LIMIT 1";
                                     file_put_contents($logFile, "  [Per-cat star grp idx={$idx} grp={$grpVal}]: " . substr($starQuery, 0, 500) . "\n", FILE_APPEND);
-                                    $starResp = $manticoreClient->sendRequest($starQuery);
+                                    $starResp = $timedRequest($starQuery);
                                     if (!$starResp->hasError()) {
                                         $grpRow = array_merge($grpRow, $starResp->getData()[0] ?? []);
                                     } else {
@@ -912,7 +927,7 @@ function run(): Task
                             } else {
                                 $starQuery = "SELECT * FROM {$mainTable} {$catWhereStr} LIMIT 1";
                                 file_put_contents($logFile, "  [Per-cat star idx={$idx}]: " . substr($starQuery, 0, 500) . "\n", FILE_APPEND);
-                                $starResp = $manticoreClient->sendRequest($starQuery);
+                                $starResp = $timedRequest($starQuery);
                                 if (!$starResp->hasError()) {
                                     $catRow = array_merge($catRow, $starResp->getData()[0] ?? []);
                                 } else {
@@ -1010,7 +1025,7 @@ function run(): Task
                     $resultRows = array_slice($resultRows, $limitOffset, $limitCount);
                 }
 
-                file_put_contents($logFile, '  Returning ' . count($resultRows) . " rows (aggregation mode)\n\n", FILE_APPEND);
+                file_put_contents($logFile, '  Returning ' . count($resultRows) . ' rows (aggregation mode) | total ' . sprintf('%.1f', (microtime(true) - $startTime) * 1000) . "ms\n\n", FILE_APPEND);
                 $result = TaskResult::withData($resultRows);
                 foreach (array_keys($resultRows[0] ?? []) as $colName) {
                     $val = $resultRows[0][$colName] ?? null;
@@ -1055,23 +1070,28 @@ function run(): Task
             }
     
             $mainSelectStr = $selectStar ? '*' : implode(', ', $mainFetchCols);
-            // Fetch enough rows to cover the requested LIMIT after expansion.
-            // Default cap of 50,000 prevents runaway memory usage.
-            // Use a large multiplier so small LIMITs (e.g. LIMIT 1) still fetch
-            // enough rows to find at least one match; always cap at 50,000.
-            $fetchLimit = $limitCount > 0 ? max(min($limitCount * 5000, 50000), 5000) : 50000;
+            // Every article in the result is already filtered by keyword_id IN (...),
+            // so every fetched row is guaranteed to match at least one category.
+            // Without ORDER BY: fetch exactly LIMIT rows (each expands to ≥1 result row).
+            // With ORDER BY: PHP sorts the expanded set, so fetch a larger batch to
+            // ensure correct ordering; cap at 50,000 to prevent runaway memory usage.
+            $fetchLimit = $limitCount > 0
+                ? ($orderBy !== '' ? min($limitCount * 100, 50000) : $limitCount)
+                : 50000;
             $mainQuery = "SELECT {$mainSelectStr} FROM {$mainTable} {$mainWhereStr} LIMIT 0, {$fetchLimit}";
 
             file_put_contents($logFile, "\n  [Main Table Query]: " . substr($mainQuery, 0, 500) . "\n", FILE_APPEND);
 
-            $mainResponse = $manticoreClient->sendRequest($mainQuery);
+            $mainResponse = $timedRequest($mainQuery);
             if ($mainResponse->hasError()) {
                 throw new RuntimeException('MVA JOIN: main table query failed: ' . $mainResponse->getError());
             }
             $articleRows = $mainResponse->getData();
             $articleRowCount = count($articleRows);
             file_put_contents($logFile, '  Main table rows: ' . $articleRowCount . "\n", FILE_APPEND);
-            if ($articleRowCount >= $fetchLimit) {
+            // Only warn when the fetch was a true cap (ORDER BY case uses limitCount*100).
+            // When fetchLimit === limitCount (no ORDER BY), hitting the limit is expected.
+            if ($articleRowCount >= $fetchLimit && $fetchLimit > $limitCount) {
                 file_put_contents($logFile, "  WARNING: main table result was capped at {$fetchLimit} rows - results may be incomplete\n", FILE_APPEND);
             }
     
@@ -1114,7 +1134,7 @@ function run(): Task
                     $catExprQuery = 'SELECT ' . implode(', ', $exprParts)
                         . " FROM {$mainTable} WHERE id IN ({$idList}) LIMIT " . count($artIds);
                     file_put_contents($logFile, "  [Mode B joinRef cat={$catIdx}]: " . substr($catExprQuery, 0, 500) . "\n", FILE_APPEND);
-                    $catExprResp = $manticoreClient->sendRequest($catExprQuery);
+                    $catExprResp = $timedRequest($catExprQuery);
                     if (!$catExprResp->hasError()) {
                         foreach ($catExprResp->getData() as $eRow) {
                             $catExprData[$catIdx][(string)($eRow['_art_id'] ?? '')] = $eRow;
@@ -1204,7 +1224,7 @@ function run(): Task
                 $resultRows = array_slice($resultRows, $limitOffset, $limitCount);
             }
     
-            file_put_contents($logFile, '  Returning ' . count($resultRows) . " rows (row mode)\n\n", FILE_APPEND);
+            file_put_contents($logFile, '  Returning ' . count($resultRows) . ' rows (row mode) | total ' . sprintf('%.1f', (microtime(true) - $startTime) * 1000) . "ms\n\n", FILE_APPEND);
             $result = TaskResult::withData($resultRows);
             foreach (array_keys($resultRows[0] ?? []) as $colName) {
                 $val = $resultRows[0][$colName] ?? null;
