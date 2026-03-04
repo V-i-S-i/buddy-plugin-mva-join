@@ -1057,11 +1057,13 @@ function run(): Task
             $mainSelectStr = $selectStar ? '*' : implode(', ', $mainFetchCols);
             // Fetch enough rows to cover the requested LIMIT after expansion.
             // Default cap of 50,000 prevents runaway memory usage.
-            $fetchLimit = $limitCount > 0 ? min($limitCount * 100, 50000) : 50000;
+            // Use a large multiplier so small LIMITs (e.g. LIMIT 1) still fetch
+            // enough rows to find at least one match; always cap at 50,000.
+            $fetchLimit = $limitCount > 0 ? max(min($limitCount * 5000, 50000), 5000) : 50000;
             $mainQuery = "SELECT {$mainSelectStr} FROM {$mainTable} {$mainWhereStr} LIMIT 0, {$fetchLimit}";
-    
+
             file_put_contents($logFile, "\n  [Main Table Query]: " . substr($mainQuery, 0, 500) . "\n", FILE_APPEND);
-    
+
             $mainResponse = $manticoreClient->sendRequest($mainQuery);
             if ($mainResponse->hasError()) {
                 throw new RuntimeException('MVA JOIN: main table query failed: ' . $mainResponse->getError());
@@ -1071,7 +1073,6 @@ function run(): Task
             file_put_contents($logFile, '  Main table rows: ' . $articleRowCount . "\n", FILE_APPEND);
             if ($articleRowCount >= $fetchLimit) {
                 file_put_contents($logFile, "  WARNING: main table result was capped at {$fetchLimit} rows - results may be incomplete\n", FILE_APPEND);
-                trigger_error("MVA JOIN: main table result capped at {$fetchLimit} rows; results may be incomplete", E_USER_WARNING);
             }
     
             // For expressions that reference join-table columns (e.g. SNIPPET(..., categories.name, ...)):
