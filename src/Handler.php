@@ -596,7 +596,6 @@ function run(): Task
 
         if ($joinRowCount >= 10000) {
             file_put_contents($logFile, "  WARNING: join table result was capped at 10000 rows - results may be incomplete\n", FILE_APPEND);
-            trigger_error('MVA JOIN: join table result capped at 10000 rows; results may be incomplete', E_USER_WARNING);
         }
 
         if (empty($joinRows)) {
